@@ -19,27 +19,7 @@ Three reward modes:
        -missing_draft_penalty  per tool call not accompanied by a draft
        +final_bonus            if the final submitted answer is correct
        -cost_per_tool          per tool called (encourages stopping early)
-     Note: when no DRAFT_ANSWER_ tokens are present the draft term is 0 but
-     cost_per_tool and missing_draft_penalty still apply (this is NOT a
-     fallback to binary).
-
-     Anti-collapse design (see tests/test_adc_reward.py):
-     - cost_per_tool warms up linearly over adc_cost_warmup_steps so the
-       tool-use skill can form before parsimony pressure is applied.
-     - Budget-truncated rollouts (trajectory ends in a dangling tool call
-       with no final answer, e.g. TRL rolled the tool result back) are NOT
-       hit with the format penalty: the truncation was not a policy choice,
-       and hammering it only punishes tool use. Pair with TRL's
-       mask_truncated_completions so these rollouts are masked from the loss.
-     - Format violations clamp the reward to min(r, 0) - format_penalty
-       instead of subtracting final_bonus + draft_bonus, so the reward floor
-       does not deepen with k (otherwise the worst rewards in the space are
-       all tool-using trajectories and GRPO learns tool aversion).
-     - IMPORTANT: this reward is designed for scale_rewards="none" (or
-       "batch"). With per-group std normalization ("group"), all-correct
-       groups have tiny std and the -cost_per_tool*k differences get
-       amplified into full-size negative advantages on every solved prompt,
-       which collapses tool use as accuracy rises.
+     Falls back to binary final reward if no DRAFT_ANSWER_ tokens are present.
 
      Incentive-compatibility notes (both exploits are tested in
      tests/test_adc_reward.py-style smoke checks):
@@ -61,48 +41,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..utils.io import append_jsonl
-from .prompt import count_unpaired_tool_turns, extract_answer_sequence, parse_final_answer
-
-
-# ---------------------------------------------------------------------------
-# CGC — Counterfactual Group Composition (Design A) support
-# ---------------------------------------------------------------------------
-# The harness disables tools for a fraction of each GRPO group (the "off arm")
-# by answering every tool call with this sentinel message. The reward detects
-# off-arm rollouts by the sentinel key and exempts them from tool costs and
-# draft-format penalties. See DESIGN_A_CGC.md.
-
-TOOLS_UNAVAILABLE_KEY = "tools_unavailable"
-TOOLS_UNAVAILABLE_MSG = (
-    '{"error": "tools_unavailable", '
-    '"detail": "Tools are disabled for this attempt. Do not call any more tools. '
-    'Answer directly now: end your reply with a single ANSWER_<TOKEN> line."}'
-)
-
-
-def _count_blocked_tool_msgs(completion: Any) -> int:
-    if not isinstance(completion, list):
-        return 0
-    n = 0
-    for msg in completion:
-        if isinstance(msg, dict) and msg.get("role") == "tool":
-            if TOOLS_UNAVAILABLE_KEY in _msg_text(msg.get("content")):
-                n += 1
-    return n
-
-
-def _transition_stats(y_hat_seq: List[Optional[str]], ground_truth: str) -> Tuple[int, int]:
-    """(corrections, corruptions) = (#W→C, #C→W) over consecutive entries."""
-    corrections = corruptions = 0
-    for i in range(len(y_hat_seq) - 1):
-        prev, curr = y_hat_seq[i], y_hat_seq[i + 1]
-        if prev is None or curr is None:
-            continue
-        if prev != ground_truth and curr == ground_truth:
-            corrections += 1
-        elif prev == ground_truth and curr != ground_truth:
-            corruptions += 1
-    return corrections, corruptions
+from .prompt import extract_answer_sequence, parse_final_answer
 
 
 # ---------------------------------------------------------------------------
@@ -112,9 +51,6 @@ def _transition_stats(y_hat_seq: List[Optional[str]], ground_truth: str) -> Tupl
 _TOOL_CALL_TAG_RE   = re.compile(r"<tool_call>", re.IGNORECASE)
 _TOOLS_TAG_RE       = re.compile(r"<tools>", re.IGNORECASE)
 _TOOL_CALLS_FIELD_RE = re.compile(r'"tool_calls"\s*:', re.IGNORECASE)
-# Qwen3.5 renders native tool calls as <function=...>/<parameter=...> XML;
-# those tags leaking into plain assistant text are artifacts too.
-_TOOL_XML_TAG_RE    = re.compile(r"<function=|<parameter=", re.IGNORECASE)
 _TOOL_NAMES = ("extractor_tool", "reasoner_tool", "verifier_tool")
 
 
@@ -126,8 +62,6 @@ def _has_plaintext_tool_artifacts(text: str) -> bool:
     if _TOOLS_TAG_RE.search(text):
         return True
     if _TOOL_CALLS_FIELD_RE.search(text):
-        return True
-    if _TOOL_XML_TAG_RE.search(text):
         return True
     for name in _TOOL_NAMES:
         if re.search(rf"\b{re.escape(name)}\s*[\(\{{:]", text, flags=re.IGNORECASE):
@@ -476,48 +410,20 @@ def build_reward_funcs(
     ccr_p_low: float = 0.6,
     ccr_k_max: int = 3,
     adc_mode: bool = False,
-    adc_cost_per_tool: float = 0.02,
-    adc_draft_bonus: float = 0.02,
+    adc_cost_per_tool: float = 0.05,
+    adc_draft_bonus: float = 0.2,
     adc_missing_draft_penalty: float = 0.1,
     adc_final_bonus: float = 1.0,
     adc_variant: str = "anytime",
-    adc_format_penalty: float = 0.2,
-    adc_cost_warmup_steps: int = 100,
-    cgc_mode: bool = False,
-    cgc_cost_per_tool: float = 0.01,
-    cgc_missing_draft_penalty: float = 0.05,
-    cgc_cost_warmup_steps: int = 100,
-    cgc_flatten: str = "novar",
     is_main_process: bool = True,
 ):
     """Construct the reward function list passed to GRPOTrainer.
 
-    Mode priority: cgc_mode > adc_mode > ccr_mode > binary.
-
-    CGC mode (Design A — counterfactual group composition):
-        Plain binary correctness plus a small per-tool cost, paired with a
-        harness that disables tools for half of each GRPO group (off arm,
-        detected here via the tools_unavailable sentinel). The routing signal
-        comes from group COMPOSITION (the group mean contains the no-tool
-        counterfactual), not from reward shaping. Off-arm rollouts are exempt
-        from tool cost and draft-format penalties. Drafts are pure telemetry:
-        no draft bonus, only a small per-tool-TURN missing-draft penalty on
-        the on arm (per-turn pairing closes the post-hoc draft hole, see
-        ADC_RESIDUAL_HOLES.md §2). cgc_flatten="novar" zeroes the gradient of
-        groups with no correctness variance (all right / all wrong) by
-        setting every reward in the group to the group mean — soft dynamic
-        sampling that removes the pure-cost anti-tool drip in hopeless or
-        trivial groups (the LLD collapse fuel) while mixed groups keep cost
-        as a parsimony tiebreaker.
+    Mode priority: adc_mode > ccr_mode > binary.
 
     ADC mode (recommended):
         Anytime per-draft correctness reward + final correctness - tool cost.
         Incentive-compatible: honest drafts are optimal (see module docstring).
-        adc_cost_warmup_steps > 0 linearly ramps cost_per_tool from 0 to its
-        target over that many steps (0 disables the warmup). Calibrate the
-        target from traces: cost_per_tool should be at most ~1/3-1/2 of
-        (corrections - corruptions) / total tool calls * final_bonus, so
-        tools stay net-positive in expectation wherever they actually help.
 
     CCR mode (legacy):
         Log scoring rule on implicit confidence from k.
@@ -528,11 +434,6 @@ def build_reward_funcs(
         R = 1.0 if correct else 0.0, plus optional bonuses.
     """
 
-    # Fallback step counter for the cost warmup when TRL does not pass
-    # trainer_state to reward functions (counts reward invocations, which
-    # tracks optimizer steps closely enough for a warmup schedule).
-    _call_count = {"n": 0}
-
     def reward_fn(
         prompts=None,
         completions=None,
@@ -541,97 +442,30 @@ def build_reward_funcs(
         choice_keys=None,
         **kwargs,
     ) -> List[float]:
-        _call_count["n"] += 1
-        _ts = kwargs.get("trainer_state")
-        _step = getattr(_ts, "global_step", None) if _ts is not None else None
-        if _step is None:
-            _step = _call_count["n"]
-
-        def _warm(target: float, warmup_steps: int) -> float:
-            if warmup_steps > 0:
-                return target * min(1.0, float(_step) / float(warmup_steps))
-            return target
-
-        cost_now = _warm(adc_cost_per_tool, adc_cost_warmup_steps)
-        cgc_cost_now = _warm(cgc_cost_per_tool, cgc_cost_warmup_steps)
-
         n     = len(completions)
         gts   = _ensure_list(ground_truth, n)
         eids  = _ensure_list(example_id, n)
         ck_lists = _ensure_list(choice_keys, n)
 
         rewards: List[float] = []
-        corrects: List[bool] = []
         fail_rows:  List[Dict[str, Any]] = []
         trace_rows: List[Dict[str, Any]] = []
-        trace_index: List[int] = []  # completion index of each trace row
 
-        for _ci, (c, gt, eid, keys) in enumerate(zip(completions, gts, eids, ck_lists)):
+        for c, gt, eid, keys in zip(completions, gts, eids, ck_lists):
             stats    = _extract_completion_stats(c)
             keys_list = list(keys) if isinstance(keys, (list, tuple)) else []
             pred     = parse_final_answer(stats["last_assistant_text"], keys_list)
 
             valid_format  = pred is not None
-            # 刷屏防护:干净的 final turn 只应有一个 ANSWER_ 且不超长。GRPO 会漂移到
-            # 重复刷 ANSWER_ 填满 budget(每个都含正确答案骗过 parse、又不打 <|im_end|>),
-            # tool_rate 随之崩。多个/零个 ANSWER_ 或超长 => 判定 format 失败。
-            # (?<!DRAFT_): SFT 学出的"final turn 先 draft 再 answer"习惯不该吃格式罚,
-            # 否则 RL 初期定点爆破的正是和工具使用绑定的 deliberation 行为。
-            _ans_hits = len(re.findall(r"(?<!DRAFT_)ANSWER_[A-Za-z0-9]", stats["last_assistant_text"]))
-            if _ans_hits != 1 or len(stats["last_assistant_text"]) > 300:
-                valid_format = False
             no_artifacts  = not stats["last_msg_has_plaintext_artifacts"]
             no_tc_in_final = not stats["last_msg_has_tool_calls"]
             base_correct  = bool(valid_format and no_artifacts and no_tc_in_final and pred == gt)
+
             k = int(stats["tool_calls"])
 
-            # ---- CGC mode (Design A: paired counterfactual arms) ----
-            cgc_stats: Dict[str, Any] = {}
-            if cgc_mode:
-                n_blocked = _count_blocked_tool_msgs(c)
-                k_eff = max(0, int(stats["tool_msgs"]) - n_blocked)
-                is_truncated = bool(stats["last_msg_has_tool_calls"]) and pred is None
-                n_tool_turns, n_unpaired = count_unpaired_tool_turns(c, keys_list)
-                # Off arm (attempted a call, got the sentinel): pure binary,
-                # no cost, no draft-format penalty — the attempt was not a
-                # policy failure, the harness said no.
-                miss = 0.0 if n_blocked > 0 else cgc_missing_draft_penalty * n_unpaired
-                cgc_r = (1.0 if base_correct else 0.0) - cgc_cost_now * k_eff - miss
-                if not (valid_format and no_artifacts and no_tc_in_final) and not is_truncated:
-                    cgc_r = min(cgc_r, 0.0) - adc_format_penalty
-                reward = float(cgc_r)
-
-                # Draft telemetry (out of the reward entirely — exogenous
-                # measurement channel; see DESIGN_A_CGC.md).
-                y_seq = extract_answer_sequence(c, keys_list)
-                drafts_seq = y_seq[:-1] if (pred is not None and y_seq) else list(y_seq)
-                first_draft = next((d for d in drafts_seq if d is not None), None)
-                n_corr, n_corrupt = _transition_stats(y_seq, str(gt))
-                cgc_stats = {
-                    "k_eff": int(k_eff),
-                    "blocked_tool_calls": int(n_blocked),
-                    "off_arm": bool(n_blocked > 0),
-                    "used_tools": bool(k_eff > 0),
-                    "n_tool_turns": int(n_tool_turns),
-                    "n_unpaired_tool_turns": int(n_unpaired),
-                    "truncated": bool(is_truncated),
-                    "y_hat_seq": [str(y) if y is not None else None for y in y_seq],
-                    "first_draft": first_draft,
-                    "first_draft_correct": (bool(first_draft == gt) if first_draft is not None else None),
-                    "corrections": int(n_corr),
-                    "corruptions": int(n_corrupt),
-                    "cost_per_tool_effective": round(float(cgc_cost_now), 4),
-                }
-
             # ---- ADC mode ----
-            elif adc_mode:
+            if adc_mode:
                 y_hat_seq = extract_answer_sequence(c, keys_list)
-                # Dangling tool call with no final answer = the rollout was cut
-                # by the completion budget (TRL rolls the tool result back),
-                # not a policy choice. Exempt it from the format penalty —
-                # otherwise every budget event is a large anti-tool gradient
-                # that only tool-using trajectories can receive.
-                is_truncated = bool(stats["last_msg_has_tool_calls"]) and pred is None
                 adc_r, adc_stats = _compute_adc_reward(
                     y_hat_seq=y_hat_seq,
                     ground_truth=str(gt),
@@ -639,18 +473,13 @@ def build_reward_funcs(
                     draft_bonus=adc_draft_bonus,
                     missing_draft_penalty=adc_missing_draft_penalty,
                     final_bonus=adc_final_bonus,
-                    cost_per_tool=cost_now,
+                    cost_per_tool=adc_cost_per_tool,
                     has_final=(pred is not None),
                     variant=adc_variant,
                 )
-                if not (valid_format and no_artifacts and no_tc_in_final) and not is_truncated:
-                    # Format violation chosen by the policy: forfeit any
-                    # positive reward and pay a flat penalty. Clamp instead of
-                    # subtracting final_bonus+draft_bonus so the floor does not
-                    # deepen with k (the old blanket -1.2 put every deep reward
-                    # valley on the tool-using side of the space).
-                    adc_r = min(adc_r, 0.0) - adc_format_penalty
-                adc_stats["truncated"] = bool(is_truncated)
+                if not (valid_format and no_artifacts and no_tc_in_final):
+                    # Format violation: zero final bonus, add format penalty
+                    adc_r = adc_r - adc_final_bonus - adc_draft_bonus
                 reward = float(adc_r)
 
             # ---- CCR mode (legacy) ----
@@ -669,7 +498,6 @@ def build_reward_funcs(
                     reward = reward + tool_use_bonus
 
             rewards.append(float(reward))
-            corrects.append(bool(base_correct))
 
             if not base_correct and is_main_process and fail_buffer_jsonl:
                 fail_rows.append({
@@ -698,14 +526,10 @@ def build_reward_funcs(
                     "tool_msgs": int(stats["tool_msgs"]),
                     "tool_names_called": list(stats["tool_names_called"]),
                     "reward_mode": (
-                        "cgc" if cgc_mode else (
-                            f"adc:{adc_variant}" if adc_mode else ("ccr" if ccr_mode else "binary")
-                        )
+                        f"adc:{adc_variant}" if adc_mode else ("ccr" if ccr_mode else "binary")
                     ),
                 }
-                if cgc_mode:
-                    trace_entry.update(cgc_stats)
-                elif adc_mode:
+                if adc_mode:
                     trace_entry.update({
                         "y_hat_seq": adc_stats.get("y_hat_seq", []),
                         "corrections": adc_stats.get("corrections", 0),
@@ -716,40 +540,12 @@ def build_reward_funcs(
                         "draft_reward": adc_stats.get("draft_reward", 0.0),
                         "final_reward": adc_stats.get("final_reward", 0.0),
                         "tool_cost": adc_stats.get("tool_cost", 0.0),
-                        "truncated": adc_stats.get("truncated", False),
-                        "cost_per_tool_effective": round(float(cost_now), 4),
                     })
                 elif ccr_mode:
                     trace_entry["implicit_confidence"] = round(
                         _ccr_implicit_confidence(k, ccr_k_max, ccr_p_high, ccr_p_low), 4
                     )
                 trace_rows.append(trace_entry)
-                trace_index.append(_ci)
-
-        # ---- CGC group flattening (soft dynamic sampling) ----
-        # Groups with zero correctness variance (all right / all wrong) carry
-        # no routing signal; their only within-group reward differences are
-        # cost/penalty terms, which are all tool-sided and act as a constant
-        # anti-tool drip (the collapse fuel on hard datasets). Setting every
-        # reward in such a group to the group mean makes all advantages 0.
-        # Groups are identified by example_id (robust to batch ordering).
-        if cgc_mode and cgc_flatten == "novar":
-            _groups: Dict[Any, List[int]] = defaultdict(list)
-            for _i, _e in enumerate(eids):
-                if _e is not None:
-                    _groups[_e].append(_i)
-            _flattened: set = set()
-            for _e, _idxs in _groups.items():
-                if len(_idxs) < 2:
-                    continue
-                if len({corrects[_i] for _i in _idxs}) == 1:
-                    _m = sum(rewards[_i] for _i in _idxs) / len(_idxs)
-                    for _i in _idxs:
-                        rewards[_i] = float(_m)
-                        _flattened.add(_i)
-            for _pos, _i in enumerate(trace_index):
-                trace_rows[_pos]["reward"] = float(rewards[_i])
-                trace_rows[_pos]["flattened"] = bool(_i in _flattened)
 
         if fail_rows and fail_buffer_jsonl:
             append_jsonl(fail_buffer_jsonl, fail_rows)
@@ -758,9 +554,7 @@ def build_reward_funcs(
 
         return rewards
 
-    if cgc_mode:
-        reward_fn.__name__ = "cgc_paired_binary"
-    elif adc_mode:
+    if adc_mode:
         reward_fn.__name__ = f"adc_{adc_variant}"
     elif ccr_mode:
         reward_fn.__name__ = "ccr_log_scoring"

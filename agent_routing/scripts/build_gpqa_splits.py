@@ -1,19 +1,21 @@
-"""Build GPQA caches with the complete Diamond split excluded from training.
+"""Build GPQA train/eval caches with a diamond-held-out eval set.
 
 GPQA subsets are NESTED: diamond (198) ⊆ main (448) ⊆ extended (546).
-This script creates:
+This script splits the 546-question extended set into:
 
-  - eval : all 198 Diamond questions (or a reporting subset)
-  - train: Extended minus *all* Diamond questions (348 questions)
+  - eval : N diamond questions (seeded sample)      -> gpqa_diamond_eval{N}.jsonl
+  - train: remaining diamond + all non-diamond      -> gpqa_train{546-N}.jsonl
 
-Even when --eval_n is smaller than 198, unreported Diamond questions remain
-excluded from training so a later full-Diamond evaluation stays valid.
+Disjointness is by normalized question hash. The leftover (198-N) diamond
+questions go INTO the training pool on purpose — they are the hardest,
+highest-quality questions and teach the manager that hard questions warrant
+deeper delegation.
 
 Requires: accepted dataset terms on HF + `huggingface-cli login`.
 
 Usage (from agent_routing/):
-    python scripts/build_gpqa_splits.py                # full 198 eval
-    python scripts/build_gpqa_splits.py --eval_n 198 --seed 42 --out_dir outputs/data
+    python scripts/build_gpqa_splits.py                # eval_n=100, seed=42
+    python scripts/build_gpqa_splits.py --eval_n 100 --seed 42 --out_dir outputs/data
 """
 from __future__ import annotations
 
@@ -31,9 +33,7 @@ from src.utils.io import write_jsonl
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--eval_n", type=int, default=0,
-                    help="Number of Diamond questions to write; 0 means all 198. "
-                         "All Diamond questions remain excluded from training.")
+    ap.add_argument("--eval_n", type=int, default=100)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out_dir", type=str, default="outputs/data")
     ap.add_argument("--answer_seed", type=int, default=42)
@@ -45,19 +45,16 @@ def main() -> None:
         sys.exit("Failed to load GPQA (gated dataset — accept terms + huggingface-cli login).")
 
     dia_hashes = {question_hash(r.question) for r in dia}
+    dia_in_ext = [r for r in ext if question_hash(r.question) in dia_hashes]
     non_dia = [r for r in ext if question_hash(r.question) not in dia_hashes]
-    matched = sum(question_hash(r.question) in dia_hashes for r in ext)
-    print(f"extended={len(ext)}  diamond={len(dia)}  matched_in_ext={matched}  non_diamond={len(non_dia)}")
-    if matched < len(dia):
-        sys.exit("Diamond/Extended hash matching is incomplete; refusing to build splits.")
+    print(f"extended={len(ext)}  diamond={len(dia)}  matched_in_ext={len(dia_in_ext)}  non_diamond={len(non_dia)}")
+    if len(dia_in_ext) < len(dia):
+        print(f"WARNING: {len(dia) - len(dia_in_ext)} diamond questions not hash-matched in extended")
 
     rng = random.Random(args.seed)
-    eval_rows = list(dia)
-    rng.shuffle(eval_rows)
-    if args.eval_n > 0:
-        eval_rows = eval_rows[: min(args.eval_n, len(eval_rows))]
-    train_rows = list(non_dia)
-    rng.shuffle(train_rows)
+    rng.shuffle(dia_in_ext)
+    eval_rows = dia_in_ext[: args.eval_n]
+    train_rows = dia_in_ext[args.eval_n :] + non_dia
 
     for r in eval_rows:
         r.split = "test"
@@ -66,18 +63,17 @@ def main() -> None:
 
     # Contamination guard: eval and train must be hash-disjoint.
     eval_h = {question_hash(r.question) for r in eval_rows}
-    all_diamond_h = {question_hash(r.question) for r in dia}
     train_h = {question_hash(r.question) for r in train_rows}
     assert not (eval_h & train_h), "eval/train overlap detected"
-    assert not (all_diamond_h & train_h), "Diamond contamination detected in train"
 
     os.makedirs(args.out_dir, exist_ok=True)
     eval_path = os.path.join(args.out_dir, f"gpqa_diamond_eval{len(eval_rows)}.jsonl")
-    train_path = os.path.join(args.out_dir, f"gpqa_nondiamond_train{len(train_rows)}.jsonl")
+    train_path = os.path.join(args.out_dir, f"gpqa_train{len(train_rows)}.jsonl")
     write_jsonl(eval_path, [r.to_dict() for r in eval_rows])
     write_jsonl(train_path, [r.to_dict() for r in train_rows])
     print(f"eval  -> {eval_path}  ({len(eval_rows)} rows, all diamond, split=test)")
-    print(f"train -> {train_path}  ({len(train_rows)} non-diamond rows, split=train)")
+    print(f"train -> {train_path}  ({len(train_rows)} rows = "
+          f"{len(dia_in_ext) - len(eval_rows)} diamond + {len(non_dia)} non-diamond, split=train)")
 
 
 if __name__ == "__main__":

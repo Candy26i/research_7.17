@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 try:
     import requests as _requests
@@ -31,40 +31,15 @@ except ImportError:
     REQUESTS_AVAILABLE = False
 
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .prompts.runtime_prompts import build_runtime_messages
-from ..utils.modeling import load_text_causal_lm
 
 try:
     from peft import PeftModel
     PEFT_AVAILABLE = True
 except Exception:
     PEFT_AVAILABLE = False
-
-
-# The Manager only selects tools; long-form reasoning belongs here. Keep the
-# structured Extractor compact, give the Reasoner the largest allowance, and
-# leave enough room for a Verifier audit without making every tool equally
-# expensive by construction.
-DEFAULT_SUBAGENT_MAX_NEW_TOKENS: Dict[str, int] = {
-    "extractor": 512,
-    "reasoner": 1024,
-    "verifier": 768,
-}
-
-
-def default_subagent_max_new_tokens(agent_kind: str) -> int:
-    kind = str(agent_kind)
-    fallback = int(DEFAULT_SUBAGENT_MAX_NEW_TOKENS.get(kind, 1024))
-    env_name = f"SUBAGENT_{kind.upper()}_MAX_NEW_TOKENS"
-    raw = os.environ.get(env_name, "").strip()
-    if not raw:
-        return fallback
-    value = int(raw)
-    if value <= 0:
-        raise ValueError(f"{env_name} must be a positive integer, got {raw!r}")
-    return value
 
 
 def _render_chat(tokenizer, messages, add_generation_prompt: bool) -> str:
@@ -89,15 +64,13 @@ class FrozenSubagent:
     adapter_path: Optional[str]
     agent_kind: str             # "extractor" | "reasoner" | "verifier"
     device: str = "cuda"
-    max_new_tokens: int = 0
+    max_new_tokens: int = 1024
     dtype_str: str = "bfloat16"
 
     _tok: Any = field(init=False, default=None)
     _model: Any = field(init=False, default=None)
 
     def __post_init__(self):
-        if self.max_new_tokens <= 0:
-            self.max_new_tokens = default_subagent_max_new_tokens(self.agent_kind)
         if self.adapter_path:
             p = self.adapter_path
             if os.sep in p or p.count("/") > 1 or p.startswith("."):
@@ -119,11 +92,11 @@ class FrozenSubagent:
         )
 
         if is_full_save:
-            model = load_text_causal_lm(
+            model = AutoModelForCausalLM.from_pretrained(
                 self.adapter_path, torch_dtype=dtype, trust_remote_code=True
             ).to(self.device)
         else:
-            model = load_text_causal_lm(
+            model = AutoModelForCausalLM.from_pretrained(
                 self.base_model, torch_dtype=dtype, trust_remote_code=True
             ).to(self.device)
             if self.adapter_path:
@@ -137,14 +110,14 @@ class FrozenSubagent:
         self._model = model
 
     @torch.no_grad()
-    def generate_with_usage(
+    def generate(
         self,
         question: str,
         context: str,
         choices: Dict[str, str],
         temperature: float = 0.0,
         candidate_answer: str = "",
-    ) -> Tuple[str, Dict[str, int]]:
+    ) -> str:
         messages = build_runtime_messages(
             agent_kind=self.agent_kind,
             question=question,
@@ -166,35 +139,8 @@ class FrozenSubagent:
             gen_kwargs["temperature"] = max(temperature, 1e-6)
 
         out = self._model.generate(**inputs, **gen_kwargs)
-        prompt_tokens = int(inputs["input_ids"].shape[1])
-        gen = out[0, prompt_tokens:]
-        completion_tokens = int(gen.shape[0])
-        text = self._tok.decode(gen, skip_special_tokens=True).strip()
-        return text, {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-            "max_new_tokens": int(self.max_new_tokens),
-            "generation_cap_hit": int(completion_tokens >= self.max_new_tokens),
-        }
-
-    @torch.no_grad()
-    def generate(
-        self,
-        question: str,
-        context: str,
-        choices: Dict[str, str],
-        temperature: float = 0.0,
-        candidate_answer: str = "",
-    ) -> str:
-        text, _usage = self.generate_with_usage(
-            question,
-            context,
-            choices,
-            temperature=temperature,
-            candidate_answer=candidate_answer,
-        )
-        return text
+        gen = out[0, inputs["input_ids"].shape[1]:]
+        return self._tok.decode(gen, skip_special_tokens=True).strip()
 
 
 class SubagentPool:
@@ -235,18 +181,13 @@ class SubagentPool:
                 "agent_kind": agent_kind,
                 "example_id": int(example_id),
                 "cache_hit": True,
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "max_new_tokens": int(self._agents[agent_kind].max_new_tokens),
-                "generation_cap_hit": 0,
             })
             return self._cache[key]
 
         if agent_kind not in self._agents:
             raise KeyError(f"Subagent not registered: {agent_kind}")
 
-        text, usage = self._agents[agent_kind].generate_with_usage(
+        text = self._agents[agent_kind].generate(
             question, context, choices, candidate_answer=candidate_answer
         )
         self._cache[key] = text
@@ -256,7 +197,6 @@ class SubagentPool:
             "example_id": int(example_id),
             "cache_hit": False,
             "output_len": len(text),
-            **usage,
         })
         return text
 
@@ -285,8 +225,7 @@ class RemoteSubagentPool:
         self,
         server_url: str,
         registered_kinds: Optional[List[str]] = None,
-        max_new_tokens: int = 0,
-        max_new_tokens_by_kind: Optional[Dict[str, int]] = None,
+        max_new_tokens: int = 1024,
         timeout: int = 120,
     ) -> None:
         if not REQUESTS_AVAILABLE:
@@ -295,27 +234,13 @@ class RemoteSubagentPool:
             )
         self._server_url = server_url.rstrip("/")
         self._kinds: set = set(registered_kinds or ["extractor", "reasoner", "verifier"])
-        if max_new_tokens > 0:
-            self._max_new_tokens_by_kind = {
-                kind: int(max_new_tokens) for kind in self._kinds
-            }
-        else:
-            configured = max_new_tokens_by_kind or {}
-            self._max_new_tokens_by_kind = {
-                kind: int(configured.get(kind, default_subagent_max_new_tokens(kind)))
-                for kind in self._kinds
-            }
+        self._max_new_tokens = max_new_tokens
         self._timeout = timeout
         self._cache: Dict[str, str] = {}
         self._call_log: List[Dict[str, Any]] = []
 
     def has(self, agent_kind: str) -> bool:
         return agent_kind in self._kinds
-
-    def max_new_tokens_for(self, agent_kind: str) -> int:
-        return int(self._max_new_tokens_by_kind.get(
-            agent_kind, default_subagent_max_new_tokens(agent_kind)
-        ))
 
     def call(
         self,
@@ -330,17 +255,11 @@ class RemoteSubagentPool:
         cache_key_suffix = f"::{candidate_answer}" if candidate_answer else ""
         key = f"{cache_namespace}::{agent_kind}::{int(example_id)}{cache_key_suffix}"
         if key in self._cache:
-            cap = self.max_new_tokens_for(agent_kind)
             self._call_log.append({
                 "ts": int(time.time()),
                 "agent_kind": agent_kind,
                 "example_id": int(example_id),
                 "cache_hit": True,
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "max_new_tokens": cap,
-                "generation_cap_hit": 0,
             })
             return self._cache[key]
 
@@ -351,16 +270,12 @@ class RemoteSubagentPool:
             choices=choices,
             candidate_answer=candidate_answer,
         )
-        cap = self.max_new_tokens_for(agent_kind)
-        # Raw JSON payload for vLLM's OpenAI-compatible server: it reads
-        # chat_template_kwargs at the top level. ("extra_body" is an
-        # openai-python client concept and must not be sent on the wire.)
         payload = {
             "model": agent_kind,
             "messages": messages,
             "temperature": 0.0,
-            "max_tokens": cap,
-            "chat_template_kwargs": {"enable_thinking": False},
+            "max_tokens": self._max_new_tokens,
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
         }
         resp = _requests.post(
             f"{self._server_url}/v1/chat/completions",
@@ -368,12 +283,7 @@ class RemoteSubagentPool:
             timeout=self._timeout,
         )
         resp.raise_for_status()
-        body = resp.json()
-        text = body["choices"][0]["message"]["content"].strip()
-        usage = body.get("usage") or {}
-        prompt_tokens = int(usage.get("prompt_tokens") or 0)
-        completion_tokens = int(usage.get("completion_tokens") or 0)
-        total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+        text = resp.json()["choices"][0]["message"]["content"].strip()
 
         self._cache[key] = text
         self._call_log.append({
@@ -382,11 +292,6 @@ class RemoteSubagentPool:
             "example_id": int(example_id),
             "cache_hit": False,
             "output_len": len(text),
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-            "max_new_tokens": cap,
-            "generation_cap_hit": int(completion_tokens >= cap),
         })
         return text
 

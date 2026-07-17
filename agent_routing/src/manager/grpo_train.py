@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from datasets import Dataset
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
     from peft import PeftModel
@@ -43,23 +43,11 @@ except Exception:
     HAS_RESP_SCHEMA = False
 
 from ..benchmarks.base import StandardRow
-from ..subagents.runtime import (
-    FrozenSubagent,
-    RemoteSubagentPool,
-    SubagentPool,
-    default_subagent_max_new_tokens,
-)
-from ..utils.chat_template import (
-    ensure_nothink_chat_template,
-    generation_prompt_opens_think,
-)
+from ..subagents.runtime import FrozenSubagent, RemoteSubagentPool, SubagentPool
 from ..utils.io import write_json
-from ..utils.modeling import load_text_causal_lm
 from ..utils.seed import set_seed
 from .prompt import build_manager_system_prompt, build_manager_user_message
-import random as _random
-
-from .reward import TOOLS_UNAVAILABLE_MSG, build_reward_funcs
+from .reward import build_reward_funcs
 
 
 def _grpo_supports_environment_factory() -> bool:
@@ -152,34 +140,6 @@ def verifier_tool(example_id: int, current_draft: str = "") -> str:
     return _run_tool("verifier", int(example_id), candidate_answer=str(current_draft or ""))
 
 
-# --- CGC (Design A) arm assignment state ---
-# Configured once per training run via _cgc_configure(). Each environment
-# reset() (= one rollout) samples an arm: off-arm rollouts have every tool
-# call answered with the tools_unavailable sentinel, giving each GRPO group
-# a built-in no-tool counterfactual baseline. With off_fraction=0.5 arms
-# alternate deterministically (exact 50% marginal; exact 4/4 per group when
-# episode creation is group-contiguous); other fractions use a seeded RNG.
-_CGC = {"enabled": False, "off_fraction": 0.5, "counter": 0, "rng": None}
-
-
-def _cgc_configure(enabled: bool, off_fraction: float, seed: int) -> None:
-    _CGC["enabled"] = bool(enabled)
-    _CGC["off_fraction"] = float(off_fraction)
-    _CGC["counter"] = 0
-    _CGC["rng"] = _random.Random(int(seed))
-
-
-def _cgc_sample_off_arm() -> bool:
-    if not _CGC["enabled"]:
-        return False
-    f = float(_CGC["off_fraction"])
-    if abs(f - 0.5) < 1e-9:
-        _CGC["counter"] += 1
-        return (_CGC["counter"] % 2) == 0
-    rng = _CGC["rng"] or _random.Random(0)
-    return rng.random() < f
-
-
 class ManagerToolEnvironment:
     """Environment-binding alternative: tools don't take an example_id arg."""
 
@@ -194,7 +154,6 @@ class ManagerToolEnvironment:
         """
         self.example_id = int(example_id)
         self._called = set()
-        self._tools_blocked = _cgc_sample_off_arm()
         return None
 
     def _guard_repeat(self, kind: str) -> Optional[str]:
@@ -213,8 +172,6 @@ class ManagerToolEnvironment:
         Returns:
             JSON string with extracted facts.
         """
-        if getattr(self, "_tools_blocked", False):
-            return TOOLS_UNAVAILABLE_MSG
         err = self._guard_repeat("extractor")
         if err:
             return err
@@ -226,8 +183,6 @@ class ManagerToolEnvironment:
         Returns:
             JSON string with reasoning structure.
         """
-        if getattr(self, "_tools_blocked", False):
-            return TOOLS_UNAVAILABLE_MSG
         err = self._guard_repeat("reasoner")
         if err:
             return err
@@ -242,8 +197,6 @@ class ManagerToolEnvironment:
         Returns:
             JSON string with relevant principles, checks, and potential errors.
         """
-        if getattr(self, "_tools_blocked", False):
-            return TOOLS_UNAVAILABLE_MSG
         err = self._guard_repeat("verifier")
         if err:
             return err
@@ -252,109 +205,6 @@ class ManagerToolEnvironment:
             getattr(self, "example_id", -1),
             candidate_answer=str(current_draft or ""),
         )
-
-
-# ----------------------- Tool interface pre-flight -----------------------
-
-_PREFLIGHT_TOOL_CALL = {
-    "id": "preflight_1",
-    "type": "function",
-    "function": {"name": "verifier_tool", "arguments": {"current_draft": "B"}},
-}
-
-
-def preflight_tool_interface_check(tok, chat_template_kwargs: Dict[str, Any]) -> None:
-    """Fail fast if the template <-> parser round trip cannot carry a tool call.
-
-    The failure mode this guards against is *silent*: if the generation prompt
-    ends with an open ``<think>`` tag, or the response template/schema does not
-    match the format the chat template renders, TRL decodes every completion
-    without a ``tool_calls`` field, no tool ever executes, tools/call_frequency
-    logs 0.0 forever, and the reward collapses — with no error raised anywhere.
-    Set AGENT_ROUTING_SKIP_PREFLIGHT=1 to bypass (not recommended).
-    """
-    if os.environ.get("AGENT_ROUTING_SKIP_PREFLIGHT", "0") == "1":
-        print("[MANAGER_GRPO] preflight skipped via AGENT_ROUTING_SKIP_PREFLIGHT=1")
-        return
-
-    # 1) In non-thinking mode, the generation prompt must not end with an open
-    #    <think> tag — with the configured kwargs AND without them (the bare
-    #    render covers TRL/vLLM render sites that may not forward
-    #    chat_template_kwargs). In thinking mode an open <think> is expected:
-    #    the model closes it before calling tools, which parses fine.
-    thinking_mode = bool(chat_template_kwargs.get("enable_thinking"))
-    if not thinking_mode and generation_prompt_opens_think(tok, chat_template_kwargs):
-        raise RuntimeError(
-            "Tool-call preflight failed: the generation prompt ends with an "
-            "open <think> tag even with the configured chat_template_kwargs "
-            f"({chat_template_kwargs}). The tool-call parser will swallow "
-            "every completion into reasoning_content and the tool call rate "
-            "will be 0. Use a nothink chat template (see "
-            "src/utils/chat_template.ensure_nothink_chat_template) or set "
-            "enable_thinking accordingly."
-        )
-    if not thinking_mode and generation_prompt_opens_think(tok):
-        print(
-            "[MANAGER_GRPO] WARNING: the chat template still opens <think> when "
-            "enable_thinking is not passed. Render sites that drop "
-            "chat_template_kwargs will silently break tool-call parsing."
-        )
-
-    # 2) Round-trip a native tool call through the template and the parser the
-    #    trainer will actually use (response_template / response_schema).
-    has_parser = (
-        getattr(tok, "response_template", None) is not None
-        or getattr(tok, "response_schema", None) is not None
-    )
-    if not has_parser:
-        raise RuntimeError(
-            "Tool-call preflight failed: the tokenizer has neither "
-            "response_template nor response_schema, so TRL will decode "
-            "completions as plain text and never see a tool call. "
-            "trl.chat_template_utils.add_response_schema most likely failed "
-            "to recognize this chat template — check the TRL version."
-        )
-    conversation = [
-        {"role": "user", "content": "preflight"},
-        {"role": "assistant", "content": "DRAFT_ANSWER_B", "tool_calls": [_PREFLIGHT_TOOL_CALL]},
-    ]
-    prompt_ids = tok.apply_chat_template(
-        conversation[:1], add_generation_prompt=True, tokenize=True,
-        **chat_template_kwargs,
-    )
-    full_text = tok.apply_chat_template(
-        conversation, add_generation_prompt=False, tokenize=False,
-        **chat_template_kwargs,
-    )
-    prompt_text = tok.apply_chat_template(
-        conversation[:1], add_generation_prompt=True, tokenize=False,
-        **chat_template_kwargs,
-    )
-    if not full_text.startswith(prompt_text):
-        raise RuntimeError(
-            "Tool-call preflight failed: the chat template is not "
-            "prefix-preserving for a tool-calling assistant turn."
-        )
-    completion_ids = tok(full_text[len(prompt_text):], add_special_tokens=False)["input_ids"]
-    try:
-        from trl.chat_template_utils import parse_response as _trl_parse_response
-        parsed = _trl_parse_response(tok, completion_ids, prefix=prompt_ids)
-    except ImportError:
-        parsed = tok.parse_response(completion_ids, prefix=prompt_ids)
-    if not parsed.get("tool_calls"):
-        raise RuntimeError(
-            "Tool-call preflight failed: a tool call rendered by this chat "
-            "template does not parse back into `tool_calls` "
-            f"(parsed={parsed!r}). The trainer would log tools/call_frequency "
-            "= 0 forever. Check that the response template/schema matches the "
-            "chat template (trl.chat_template_utils.add_response_schema) and "
-            "that the template does not default to thinking mode."
-        )
-    print(
-        "[MANAGER_GRPO] tool-interface preflight OK: "
-        f"parsed tool_calls={[(tc.get('function') or {}).get('name') for tc in parsed['tool_calls']]}, "
-        f"content={parsed.get('content')!r}"
-    )
 
 
 # ----------------------- Trainer entry point -----------------------
@@ -372,16 +222,10 @@ class ManagerGRPOConfig:
     raw_trace_jsonl: Optional[str] = None
     seed: int = 42
     per_device_train_batch_size: int = 2
-    max_completion_length: int = 1024
+    max_completion_length: int = 2048
     temperature: float = 0.9
-    top_p: float = 0.95
-    top_k: int = 20
-    min_p: float = 0.0
-    enable_thinking: bool = False
     num_generations: int = 6
-    generation_batch_size: int = 0
-    learning_rate: float = 1e-6
-    grpo_beta: float = 0.001
+    grpo_beta: float = 0.01
     max_steps: int = -1
     routing_efficiency_bonus: float = 0.0
     tool_use_bonus: float = 0.0
@@ -402,33 +246,11 @@ class ManagerGRPOConfig:
     clip_epsilon_high: float = 0.0       # DAPO Clip-Higher: asymmetric clip upper bound (0 = symmetric/standard)
     # Adaptive Deliberation Control reward (replaces CCR)
     adc_mode: bool = False               # enable ADC anytime per-draft reward (recommended over ccr_mode)
-    adc_cost_per_tool: float = 0.02      # per-tool cost TARGET; calibrate to <= 1/3-1/2 of the empirical
-                                         # marginal tool value (corrections-corruptions)/tool_calls
-    adc_draft_bonus: float = 0.02        # bonus scale for the anytime draft-correctness average. Kept small:
-                                         # any draft-content bonus taxes corrected trajectories and subsidizes
-                                         # k=0; honest drafts are already environment-incentivized via
-                                         # verifier_tool(current_draft) -> final accuracy
-    adc_missing_draft_penalty: float = 0.1  # penalty per tool call without an accompanying draft (format-only)
+    adc_cost_per_tool: float = 0.05      # per-tool cost (discourages over-calling without utility)
+    adc_draft_bonus: float = 0.2         # bonus per CORRECT draft answer (anytime reward)
+    adc_missing_draft_penalty: float = 0.1  # penalty per tool call without an accompanying draft
     adc_final_bonus: float = 1.0         # bonus for final correct answer
     adc_variant: str = "anytime"         # anytime | transition | sum (latter two: ablation arms only)
-    adc_format_penalty: float = 0.2      # flat penalty on policy-chosen format violations (reward clamped to
-                                         # min(r,0)-penalty; truncated rollouts are exempt)
-    adc_cost_warmup_steps: int = 100     # linearly ramp cost_per_tool 0 -> target over N steps (0 = off);
-                                         # lets tool skills form before parsimony pressure applies
-    scale_rewards: str = "none"          # GRPO advantage scaling: none|batch|group. "group" amplifies the
-                                         # tiny -cost*k gaps in all-correct groups into full-size negative
-                                         # advantages and collapses tool use as accuracy rises. "none"
-                                         # (Dr. GRPO) keeps cost at its nominal scale; "batch" is a middle
-                                         # ground if parsimony learns too slowly under "none".
-    # CGC — Counterfactual Group Composition (Design A; see DESIGN_A_CGC.md)
-    cgc_mode: bool = False               # paired arms: harness disables tools for part of each group;
-                                         # reward is binary + small cost. Takes priority over adc_mode.
-    cgc_off_arm_fraction: float = 0.5    # fraction of rollouts with tools disabled (0.5 = alternating)
-    cgc_cost_per_tool: float = 0.01      # small per-tool cost on the on arm (parsimony tiebreaker)
-    cgc_missing_draft_penalty: float = 0.05  # per tool-TURN lacking a DRAFT line (on arm only)
-    cgc_cost_warmup_steps: int = 100     # linear ramp of cgc_cost_per_tool from 0 (0 = off)
-    cgc_flatten: str = "novar"           # novar|none: zero the gradient of groups with no correctness
-                                         # variance (soft dynamic sampling; kills the pure-cost drip)
 
 
 def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
@@ -446,18 +268,6 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         raise RuntimeError(
             "binding_mode=environment requires a TRL version with environment_factory."
         )
-
-    # ---- CGC (Design A) arm assignment ----
-    if cfg.cgc_mode and binding_mode != "environment":
-        raise RuntimeError(
-            "cgc_mode (Design A paired counterfactual arms) requires "
-            "binding_mode=environment: arm assignment happens in "
-            "ManagerToolEnvironment.reset(), which the argument-binding tool "
-            "functions do not have."
-        )
-    if cfg.cgc_mode and cfg.adc_mode:
-        print("[MANAGER_GRPO] WARNING: cgc_mode takes priority over adc_mode; ADC reward is ignored.")
-    _cgc_configure(cfg.cgc_mode, cfg.cgc_off_arm_fraction, cfg.seed)
     print(f"[MANAGER_GRPO] binding_mode={binding_mode}")
 
     # ---- Build subagent pool ----
@@ -564,47 +374,11 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
     manager_tok.padding_side = "left"
     if manager_tok.pad_token_id is None and manager_tok.eos_token_id is not None:
         manager_tok.pad_token_id = manager_tok.eos_token_id
-
-    # Qwen3.5 ships the THINK template variant: by default the generation
-    # prompt ends with an open `<think>` tag, and the tool-call parser then
-    # swallows the whole (non-thinking) completion into reasoning_content —
-    # tool call rate reads exactly 0, silently. Normalize the template default
-    # to nothink BEFORE the response schema is chosen, so both match.
-    if not cfg.enable_thinking:
-        ensure_nothink_chat_template(manager_tok, tag="MANAGER_GRPO")
-
     if HAS_RESP_SCHEMA:
         try:
             manager_tok = add_response_schema(manager_tok)
-        except Exception as e:
-            # Do NOT swallow this silently: without a response template/schema
-            # TRL falls back to plain-text decoding and never parses a tool
-            # call. The preflight below turns this into a hard error.
-            print(f"[MANAGER_GRPO] WARNING: add_response_schema failed: {e}")
-
-    preflight_tool_interface_check(
-        manager_tok, {"enable_thinking": bool(cfg.enable_thinking)}
-    )
-
-    # Tool results are appended INSIDE the completion budget: TRL rolls back
-    # any tool result that would push the sequence past max_completion_length,
-    # so a budget smaller than a single subagent reply makes every tool call
-    # useless even when parsing works.
-    _max_tool_tokens = max(
-        default_subagent_max_new_tokens(k)
-        for k in ("extractor", "reasoner", "verifier")
-    )
-    _recommended = _max_tool_tokens * 2 + 512
-    if cfg.max_completion_length < _max_tool_tokens + 256:
-        print(
-            f"[MANAGER_GRPO] WARNING: max_completion_length="
-            f"{cfg.max_completion_length} cannot fit a single largest tool "
-            f"reply ({_max_tool_tokens} tokens) plus the manager's turns. "
-            f"TRL will roll the tool results back and trajectories will end "
-            f"tool-less. Use at least {_recommended} "
-            f"(--mgr_max_completion_length {_recommended}) or lower "
-            f"SUBAGENT_*_MAX_NEW_TOKENS."
-        )
+        except Exception:
+            pass
 
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
     is_full_init = (
@@ -614,12 +388,12 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         and not os.path.exists(os.path.join(cfg.manager_adapter, "adapter_config.json"))
     )
     if cfg.full_parameter_rl and is_full_init:
-        manager_model = load_text_causal_lm(
+        manager_model = AutoModelForCausalLM.from_pretrained(
             cfg.manager_adapter, torch_dtype=dtype, trust_remote_code=True
         ).to(device)
         print(f"[MANAGER_GRPO] full-parameter init model -> {cfg.manager_adapter}")
     else:
-        manager_model = load_text_causal_lm(
+        manager_model = AutoModelForCausalLM.from_pretrained(
             cfg.base_model, torch_dtype=dtype, trust_remote_code=True
         ).to(device)
         if cfg.manager_adapter:
@@ -652,46 +426,20 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         # Allows larger updates when increasing probability of under-explored actions
         # without symmetrically loosening the lower bound that guards against collapse.
         _grpo_extra["epsilon_high"] = float(cfg.clip_epsilon_high)
-    if cfg.generation_batch_size > 0:
-        if "generation_batch_size" not in inspect.signature(GRPOConfig.__init__).parameters:
-            raise RuntimeError(
-                "The installed TRL does not support generation_batch_size. "
-                "Upgrade TRL before using --mgr_generation_batch_size."
-            )
-        if cfg.generation_batch_size % cfg.num_generations != 0:
-            raise ValueError(
-                "generation_batch_size must be divisible by num_generations; "
-                f"got {cfg.generation_batch_size} and {cfg.num_generations}."
-            )
-        _grpo_extra["generation_batch_size"] = int(cfg.generation_batch_size)
-    # Budget-truncated completions (no EOS) carry no usable learning signal and
-    # their rewards are dominated by the truncation, not the policy; mask them
-    # from the loss so budget events stop acting as anti-tool gradients.
-    if "mask_truncated_completions" in inspect.signature(GRPOConfig.__init__).parameters:
-        _grpo_extra["mask_truncated_completions"] = True
-    else:
-        print(
-            "[MANAGER_GRPO] WARNING: installed TRL lacks mask_truncated_completions; "
-            "budget-truncated rollouts will enter the loss. Upgrade TRL."
-        )
     grpo_args = GRPOConfig(
         output_dir=cfg.out_dir,
         remove_unused_columns=False,
         max_completion_length=int(cfg.max_completion_length),
         temperature=float(cfg.temperature),
-        top_p=float(cfg.top_p),
-        top_k=int(cfg.top_k),
-        min_p=float(cfg.min_p),
         num_generations=int(cfg.num_generations),
-        learning_rate=float(cfg.learning_rate),
         bf16=(device == "cuda"),
         beta=float(cfg.grpo_beta),
-        scale_rewards=str(cfg.scale_rewards),
+        scale_rewards="group",
         report_to=(["wandb"] if cfg.use_wandb else []),
         use_vllm=False,
         per_device_train_batch_size=int(cfg.per_device_train_batch_size),
         max_tool_calling_iterations=3,           # we allow up to 3 tools
-        chat_template_kwargs={"enable_thinking": bool(cfg.enable_thinking)},
+        chat_template_kwargs={"enable_thinking": False},
         logging_steps=1,
         log_completions=True,
         num_completions_to_print=None,
@@ -715,47 +463,16 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         adc_missing_draft_penalty=cfg.adc_missing_draft_penalty,
         adc_final_bonus=cfg.adc_final_bonus,
         adc_variant=cfg.adc_variant,
-        adc_format_penalty=cfg.adc_format_penalty,
-        adc_cost_warmup_steps=cfg.adc_cost_warmup_steps,
-        cgc_mode=cfg.cgc_mode,
-        cgc_cost_per_tool=cfg.cgc_cost_per_tool,
-        cgc_missing_draft_penalty=cfg.cgc_missing_draft_penalty,
-        cgc_cost_warmup_steps=cfg.cgc_cost_warmup_steps,
-        cgc_flatten=cfg.cgc_flatten,
         is_main_process=is_main,
     )
-    if cfg.cgc_mode:
-        print(
-            f"[MANAGER_GRPO] CGC mode ON (Design A)  "
-            f"off_arm_fraction={cfg.cgc_off_arm_fraction}  "
-            f"cost_per_tool={cfg.cgc_cost_per_tool}  "
-            f"cost_warmup_steps={cfg.cgc_cost_warmup_steps}  "
-            f"missing_draft_penalty={cfg.cgc_missing_draft_penalty}  "
-            f"flatten={cfg.cgc_flatten}  "
-            f"scale_rewards={cfg.scale_rewards}"
-        )
-        if cfg.scale_rewards == "group":
-            print(
-                "[MANAGER_GRPO] WARNING: scale_rewards='group' re-amplifies "
-                "cost gaps in low-variance groups. Use 'none' or 'batch' with CGC."
-            )
-    elif cfg.adc_mode:
+    if cfg.adc_mode:
         print(
             f"[MANAGER_GRPO] ADC mode ON  variant={cfg.adc_variant}  "
             f"draft_bonus={cfg.adc_draft_bonus}  "
             f"missing_draft_penalty={cfg.adc_missing_draft_penalty}  "
             f"final_bonus={cfg.adc_final_bonus}  "
-            f"cost_per_tool={cfg.adc_cost_per_tool}  "
-            f"cost_warmup_steps={cfg.adc_cost_warmup_steps}  "
-            f"format_penalty={cfg.adc_format_penalty}  "
-            f"scale_rewards={cfg.scale_rewards}"
+            f"cost_per_tool={cfg.adc_cost_per_tool}"
         )
-        if cfg.scale_rewards == "group":
-            print(
-                "[MANAGER_GRPO] WARNING: scale_rewards='group' with ADC amplifies "
-                "per-tool cost differences in all-correct groups into full-size "
-                "negative advantages -> tool-use collapse. Use 'none' or 'batch'."
-            )
         if cfg.adc_variant != "anytime":
             print(
                 f"[MANAGER_GRPO] WARNING: adc_variant={cfg.adc_variant} is a provably "
@@ -808,19 +525,8 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         "binding_mode": binding_mode,
         "n_train_rows": len(cfg.rows),
         "subagents": subagent_keys,
-        "subagent_max_new_tokens": {
-            kind: default_subagent_max_new_tokens(kind) for kind in subagent_keys
-        },
         "manager_adapter": cfg.manager_adapter,
         "full_parameter_rl": bool(cfg.full_parameter_rl),
-        "enable_thinking": bool(cfg.enable_thinking),
-        "max_completion_length": int(cfg.max_completion_length),
-        "temperature": float(cfg.temperature),
-        "top_p": float(cfg.top_p),
-        "top_k": int(cfg.top_k),
-        "min_p": float(cfg.min_p),
-        "learning_rate": float(cfg.learning_rate),
-        "generation_batch_size": int(cfg.generation_batch_size),
         "subagent_server_url": cfg.subagent_server_url or "",
         "routing_efficiency_bonus": cfg.routing_efficiency_bonus,
         "tool_use_bonus": cfg.tool_use_bonus,
@@ -834,15 +540,5 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         "adc_missing_draft_penalty": float(cfg.adc_missing_draft_penalty),
         "adc_final_bonus": float(cfg.adc_final_bonus),
         "adc_variant": str(cfg.adc_variant),
-        "adc_format_penalty": float(cfg.adc_format_penalty),
-        "adc_cost_warmup_steps": int(cfg.adc_cost_warmup_steps),
-        "cgc_mode": bool(cfg.cgc_mode),
-        "cgc_off_arm_fraction": float(cfg.cgc_off_arm_fraction),
-        "cgc_cost_per_tool": float(cfg.cgc_cost_per_tool),
-        "cgc_missing_draft_penalty": float(cfg.cgc_missing_draft_penalty),
-        "cgc_cost_warmup_steps": int(cfg.cgc_cost_warmup_steps),
-        "cgc_flatten": str(cfg.cgc_flatten),
-        "scale_rewards": str(cfg.scale_rewards),
-        "mask_truncated_completions": bool(_grpo_extra.get("mask_truncated_completions", False)),
     })
     print(f"[MANAGER_GRPO] saved -> {cfg.out_dir}")

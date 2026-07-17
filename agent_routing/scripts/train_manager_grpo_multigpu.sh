@@ -12,7 +12,7 @@
 #
 # Example (MedQA, from cold-start adapter):
 #   bash scripts/train_manager_grpo_multigpu.sh openai_us4_500_runtime_raw \
-#       --base_model Qwen/Qwen3.5-9B \
+#       --base_model Qwen/Qwen3-8B \
 #       --medqa_normalized_cache outputs/data/medqa_us4_normalized.jsonl \
 #       --train_size 1200 \
 #       --exclude_sft_example_ids outputs/sft_data/openai_us4_500/extractor_runtime_raw_sft.jsonl \
@@ -48,13 +48,9 @@ done
 
 # Defaults below are overridable: argparse takes the LAST occurrence of a flag,
 # and "$@" comes after these, so anything you pass wins.
-# num_generations=8 exactly divides the global batch (3 GPUs x bs 8 = 24); the
+# num_generations=6 exactly divides the global batch (3 GPUs x bs 2); the
 # reward mode (--mgr_adc_mode etc.) is intentionally NOT set here — pass it
 # per experiment arm (see EXPERIMENTS.md).
-# max_completion_length=4096: TRL counts injected tool-result tokens against
-# the completion budget and ROLLS BACK any tool result that would exceed it.
-# The reasoner alone can return 1024 tokens, so 1024 made every tool call
-# useless; 4096 fits a 3-tool trajectory (512+1024+768 tool tokens + turns).
 VENV_DIR="${VENV_DIR:-/home/yizzhao/research_0703/.venv}"
 VIRTUAL_ENV="${VENV_DIR}" PATH="${VENV_DIR}/bin:$PATH" CUDA_VISIBLE_DEVICES=1,2,3 \
 PYTHONUTF8=1 \
@@ -64,14 +60,9 @@ accelerate launch \
     --teacher_id "${TEACHER_ID}" \
     --subagent_server_url "${SERVER_URL}" \
     --mgr_full_parameter_rl \
-    --mgr_bs 8 \
-    --mgr_num_generations 8 \
-    --mgr_generation_batch_size 8 \
-    --mgr_max_completion_length 4096 \
+    --mgr_bs 2 \
+    --mgr_num_generations 6 \
+    --mgr_max_completion_length 3072 \
     --mgr_temperature 1.0 \
-    --mgr_top_p 0.95 \
-    --mgr_top_k 20 \
-    --mgr_min_p 0.0 \
-    --mgr_learning_rate 1e-6 \
-    --mgr_grpo_beta 0.001 \
+    --mgr_grpo_beta 0.01 \
     "$@"

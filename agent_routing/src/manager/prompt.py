@@ -84,66 +84,12 @@ def build_manager_system_prompt(
         + hint_block + "\n"
         "Output rules:\n"
         "  - Use the native tool-calling interface. Do NOT write tool calls as text, XML, or JSON.\n"
-        "  - In a turn where you call a tool, output exactly one DRAFT_ANSWER_ line \n"
-        "    plus the native tool call, but NOT the final ANSWER_.\n"
+        "  - In a turn where you call a tool, output DRAFT_ANSWER_ but NOT the final ANSWER_.\n"
         "  - When you are ready to submit your final answer (no more tools), end with exactly:\n"
         + answer_lines + "\n"
-        "  - Do not provide free-form reasoning, explanations, JSON, or XML in text.\n"
-        "  - A final turn contains exactly one ANSWER_ line and nothing else.\n"
+        "  - Brief reasoning above the ANSWER_ line is allowed; nothing after it.\n"
         "  - Do not output <think> tags.\n"
     )
-
-
-def build_manager_tool_schemas(binding_mode: str) -> List[Dict[str, Any]]:
-    """OpenAI-style JSON schemas for the three manager tools.
-
-    Single source of truth shared by manager SFT (rendered into the prompt so
-    training matches rollout), evaluation, and any server-side tool wiring.
-    GRPO training passes Python callables to TRL, which derives equivalent
-    schemas from their signatures/docstrings — keep both in sync.
-    """
-    required = ["example_id"] if binding_mode == "argument" else []
-    properties: Dict[str, Any] = (
-        {
-            "example_id": {
-                "type": "integer",
-                "description": "The current example ID from the user message.",
-            }
-        }
-        if binding_mode == "argument"
-        else {}
-    )
-    verifier_properties = dict(properties)
-    verifier_properties["current_draft"] = {
-        "type": "string",
-        "description": "Your current draft answer key (e.g. \"B\") to audit.",
-    }
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": "extractor_tool",
-                "description": "Extract decision-relevant factual signals from the question and context.",
-                "parameters": {"type": "object", "properties": properties, "required": required},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "reasoner_tool",
-                "description": "Produce a structured reasoning scaffold for the choices.",
-                "parameters": {"type": "object", "properties": properties, "required": required},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "verifier_tool",
-                "description": "Identify relevant domain principles and audit the reasoning for logical or computational errors. Pass your current draft answer via current_draft.",
-                "parameters": {"type": "object", "properties": verifier_properties, "required": required},
-            },
-        },
-    ]
 
 
 def build_manager_user_message(
@@ -176,34 +122,20 @@ def build_manager_user_message(
     return "\n".join(lines)
 
 
-# def parse_final_answer(text: str, choice_keys: List[str]) -> Optional[str]:
-#     """Parse the final ANSWER_<TOKEN> line and map to a canonical choice key."""
-#     if not text:
-#         return None
-#     lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
-#     if not lines:
-#         return None
-#     m = ANSWER_LASTLINE_RE_FOR_KEYS.match(lines[-1])
-#     if not m:
-#         return None
-#     token = m.group(1).upper()
-#     for k in choice_keys:
-#         if _label_to_token(k) == token:
-#             return k
-#     return None
 def parse_final_answer(text: str, choice_keys: List[str]) -> Optional[str]:
-    """Parse the final ANSWER_<TOKEN> and map to a canonical choice key."""
+    """Parse the final ANSWER_<TOKEN> line and map to a canonical choice key."""
     if not text:
         return None
     lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
-    for ln in reversed(lines):
-        m = ANSWER_LASTLINE_RE_FOR_KEYS.search(ln)
-        if not m:
-            continue
-        token = m.group(1).upper()
-        for k in choice_keys:
-            if _label_to_token(k) == token:
-                return k
+    if not lines:
+        return None
+    m = ANSWER_LASTLINE_RE_FOR_KEYS.match(lines[-1])
+    if not m:
+        return None
+    token = m.group(1).upper()
+    for k in choice_keys:
+        if _label_to_token(k) == token:
+            return k
     return None
 
 
@@ -225,56 +157,15 @@ def parse_draft_answer(text: str, choice_keys: List[str]) -> Optional[str]:
     return None
 
 
-def count_unpaired_tool_turns(
-    completion: Any,
-    choice_keys: List[str],
-) -> "tuple[int, int]":
-    """Return (n_tool_turns, n_unpaired): assistant turns carrying tool_calls,
-    and how many of them lack a DRAFT_ANSWER_ line in the same turn.
-
-    Per-TURN pairing is the semantically correct enforcement of "declare a
-    draft before each tool call": a global draft count can be satisfied
-    post-hoc after seeing tool results (see ADC_RESIDUAL_HOLES.md §2), which
-    corrupts the W->C correction statistics.
-    """
-    if not isinstance(completion, list):
-        return 0, 0
-    n_turns = 0
-    n_unpaired = 0
-    for msg in completion:
-        if not isinstance(msg, dict) or msg.get("role") != "assistant":
-            continue
-        if not msg.get("tool_calls"):
-            continue
-        content = msg.get("content")
-        if isinstance(content, list):
-            text = " ".join(
-                blk.get("text", "") for blk in content
-                if isinstance(blk, dict) and "text" in blk
-            )
-        else:
-            text = str(content or "")
-        n_turns += 1
-        if parse_draft_answer(text, choice_keys) is None:
-            n_unpaired += 1
-    return n_turns, n_unpaired
-
-
 def extract_answer_sequence(
     completion: Any,
     choice_keys: List[str],
 ) -> List[Optional[str]]:
     """Extract the full sequence of candidate answers from a completion.
 
-    Scans every assistant turn for DRAFT_ANSWER_; only the LAST assistant
-    turn contributes the final ANSWER_. Returns (draft_0, ..., final) in
-    chronological order. Used by the ADC reward function.
-
-    Bare ANSWER_ lines in intermediate turns are deliberately IGNORED:
-    counting them would (a) let the policy satisfy the missing-draft penalty
-    without ever using the DRAFT_ format, and (b) let it dilute an early
-    wrong draft by echoing the (post-tool-result) answer as extra entries in
-    the anytime average — a small but farmable reward leak.
+    Scans every assistant turn for DRAFT_ANSWER_ and the final ANSWER_.
+    Returns list of (draft_0, draft_1, ..., final) in chronological order.
+    Used by the ADC reward function.
     """
     if not isinstance(completion, list):
         text = str(completion) if completion else ""
@@ -287,7 +178,7 @@ def extract_answer_sequence(
             result.append(final)
         return result
 
-    texts: List[str] = []
+    sequence: List[Optional[str]] = []
     for msg in completion:
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
@@ -299,17 +190,12 @@ def extract_answer_sequence(
             )
         else:
             text = str(content or "")
-        texts.append(text)
-
-    sequence: List[Optional[str]] = []
-    for i, text in enumerate(texts):
         if not text.strip():
             continue
         draft = parse_draft_answer(text, choice_keys)
         if draft is not None:
             sequence.append(draft)
-        if i == len(texts) - 1:
-            final = parse_final_answer(text, choice_keys)
-            if final is not None:
-                sequence.append(final)
+        final = parse_final_answer(text, choice_keys)
+        if final is not None:
+            sequence.append(final)
     return sequence

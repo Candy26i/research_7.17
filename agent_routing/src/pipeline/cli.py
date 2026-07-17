@@ -38,8 +38,6 @@ def _parse_args() -> argparse.Namespace:
         "load_medqa",
         "load_gpqa",
         "load_mmlu_pro",
-        "load_legalbench",
-        "export_base_predictions",
         "export_legalbench_jsonl",
         "synth_subagent",
         "export_deepseek_jsonl",
@@ -56,6 +54,10 @@ def _parse_args() -> argparse.Namespace:
         "eval_manager",
         "eval_manager_tools",
         "eval_manager_forced",
+        "collect_counterfactuals",
+        "fit_stop_probe",
+        "eval_manager_adaptive",
+        "export_stop_distill_sft",
     ])
 
     # Context-level flags
@@ -121,11 +123,6 @@ def _parse_args() -> argparse.Namespace:
                         help="Comma-separated HF split names to load.")
     parser.add_argument("--mmlu_pro_normalized_cache", type=str, default="")
     parser.add_argument("--mmlu_pro_refresh_cache", action="store_true")
-    parser.add_argument("--mmlu_pro_allow_test_training", action="store_true",
-                        help="Explicitly acknowledge a custom in-domain experiment that "
-                             "partitions the official MMLU-Pro test split for training. "
-                             "Results from this mode are not comparable to the standard "
-                             "MMLU-Pro test benchmark.")
 
     # Split sizes
     parser.add_argument("--train_size", type=int, default=600)
@@ -139,12 +136,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--agent_kind", type=str, default="",
                         choices=["", "extractor", "reasoner", "verifier"])
     parser.add_argument("--n_samples", type=int, default=500)
-    parser.add_argument("--base_prediction_out", type=str, default="",
-                        help="Output JSONL for base-manager predictions used by verifier synthesis.")
-    parser.add_argument("--base_prediction_n_samples", type=int, default=0,
-                        help="Number of training-pool predictions; 0 means all available rows.")
-    parser.add_argument("--base_prediction_stratify_by", type=str, default="",
-                        help="Match synthetic prompt sampling: task_subtype or metadata:<key>.")
     parser.add_argument("--synth_temperature", type=float, default=0.4)
     parser.add_argument("--synth_max_retries", type=int, default=2)
     parser.add_argument("--synth_workers", type=int, default=8,
@@ -154,22 +145,6 @@ def _parse_args() -> argparse.Namespace:
                         help="Leakage-audit against ALL choice texts instead of only the "
                              "ground-truth text. Removes the negative-space bias where the "
                              "one never-restated choice is exactly the answer.")
-    parser.add_argument("--synth_stratify_by", type=str, default="",
-                        help="Balance synthetic rows by task_subtype or metadata:<key>. "
-                             "Use task_subtype for LegalBench large5.")
-    parser.add_argument("--synth_verifier_candidate_jsonl", type=str, default="",
-                        help="JSONL with example_id, question_hash, and a "
-                             "pred/prediction/answer field. Verifier audits these real "
-                             "manager predictions.")
-    parser.add_argument("--synth_random_verifier_candidates", action="store_true",
-                        help="Legacy fallback: use random verifier candidates when no real "
-                             "prediction exists. Not recommended for main experiments.")
-    parser.add_argument("--synth_allow_empty_verifier_candidates", action="store_true",
-                        help="Explicit generic-verifier ablation with no candidate answer. "
-                             "Never use for main experiments.")
-    parser.add_argument("--synth_min_verifier_candidate_coverage", type=float, default=0.95,
-                        help="Minimum parseable manager-prediction coverage required before "
-                             "exporting verifier prompts (default 0.95).")
     parser.add_argument("--deepseek_prompt_jsonl", type=str, default="",
                         help="Prompt JSONL for local DeepSeek batch generation.")
     parser.add_argument("--deepseek_response_jsonl", type=str, default="",
@@ -184,7 +159,7 @@ def _parse_args() -> argparse.Namespace:
     # Subagent SFT
     parser.add_argument("--sft_epochs", type=int, default=3)
     parser.add_argument("--sft_lr", type=float, default=2e-4)
-    parser.add_argument("--sft_max_seq_len", type=int, default=8192)
+    parser.add_argument("--sft_max_seq_len", type=int, default=4096)
     parser.add_argument("--sft_bs", type=int, default=1)
     parser.add_argument("--sft_grad_accum", type=int, default=8)
     parser.add_argument("--sft_max_steps", type=int, default=-1)
@@ -195,26 +170,10 @@ def _parse_args() -> argparse.Namespace:
 
     # Manager GRPO
     parser.add_argument("--mgr_bs", type=int, default=2)
-    parser.add_argument("--mgr_max_completion_length", type=int, default=4096,
-                        help="Completion budget per rollout. Tool results count "
-                             "against it (TRL rolls back tool results that would "
-                             "exceed it), so it must fit the subagent replies: "
-                             "extractor 512 + reasoner 1024 + verifier 768 plus "
-                             "the manager's own turns.")
+    parser.add_argument("--mgr_max_completion_length", type=int, default=2048)
     parser.add_argument("--mgr_temperature", type=float, default=0.9)
-    parser.add_argument("--mgr_top_p", type=float, default=0.95)
-    parser.add_argument("--mgr_top_k", type=int, default=20)
-    parser.add_argument("--mgr_min_p", type=float, default=0.0)
-    parser.add_argument("--mgr_enable_thinking", action="store_true",
-                        help="Enable Qwen thinking during GRPO rollouts. Main ADC runs "
-                             "remain non-thinking; use this as a separate ablation.")
     parser.add_argument("--mgr_num_generations", type=int, default=6)
-    parser.add_argument("--mgr_generation_batch_size", type=int, default=0,
-                        help="Optional number of completions generated at once. "
-                             "Use 8 with bs=8, generations=8 to retain a global "
-                             "batch of 24 while lowering rollout peak memory.")
-    parser.add_argument("--mgr_learning_rate", type=float, default=1e-6)
-    parser.add_argument("--mgr_grpo_beta", type=float, default=0.001)
+    parser.add_argument("--mgr_grpo_beta", type=float, default=0.01)
     parser.add_argument("--mgr_routing_efficiency_bonus", type=float, default=0.0)
     parser.add_argument("--mgr_tool_use_bonus", type=float, default=0.0,
                         help="Bonus added only when the final answer is correct and at least one native tool was called.")
@@ -235,16 +194,12 @@ def _parse_args() -> argparse.Namespace:
                              "+draft_bonus per CORRECT DRAFT_ANSWER_, final bonus, tool cost. "
                              "Incentive-compatible (no sandbagging exploit). "
                              "Recommended over --mgr_ccr_mode.")
-    parser.add_argument("--mgr_adc_cost_per_tool", type=float, default=0.02,
-                        help="ADC per-tool cost TARGET subtracted from reward (default 0.02). "
-                             "Calibrate to <= 1/3-1/2 of the empirical marginal tool value "
-                             "(corrections-corruptions)/tool_calls from train_raw_trace.jsonl, "
-                             "so tools stay net-positive wherever they actually help.")
-    parser.add_argument("--mgr_adc_draft_bonus", type=float, default=0.02,
-                        help="ADC bonus scale for the anytime draft-correctness average "
-                             "(default 0.02). Kept small: any draft-content bonus taxes "
-                             "corrected trajectories and subsidizes k=0; honest drafts are "
-                             "already environment-incentivized via verifier_tool(current_draft).")
+    parser.add_argument("--mgr_adc_cost_per_tool", type=float, default=0.05,
+                        help="ADC per-tool cost subtracted from reward (default 0.05). "
+                             "Encourages the manager to stop calling tools when not helpful.")
+    parser.add_argument("--mgr_adc_draft_bonus", type=float, default=0.2,
+                        help="ADC bonus per CORRECT draft answer (default 0.2). "
+                             "Honest best-guess drafts are the unique optimal policy.")
     parser.add_argument("--mgr_adc_missing_draft_penalty", type=float, default=0.1,
                         help="ADC penalty per tool call without an accompanying "
                              "DRAFT_ANSWER_ (default 0.1). Enforces the draft format.")
@@ -257,46 +212,6 @@ def _parse_args() -> argparse.Namespace:
                              "the provably exploitable designs — ABLATION ARMS ONLY (RQ3): "
                              "transition pays for sandbagged first drafts, sum is farmable "
                              "by superfluous tool calls.")
-    parser.add_argument("--mgr_adc_format_penalty", type=float, default=0.2,
-                        help="ADC flat penalty for policy-chosen format violations; reward is "
-                             "clamped to min(r,0)-penalty (default 0.2). Budget-truncated "
-                             "rollouts (dangling tool call, no final answer) are exempt.")
-    parser.add_argument("--mgr_adc_cost_warmup_steps", type=int, default=100,
-                        help="Linearly ramp ADC cost_per_tool from 0 to its target over N "
-                             "steps (default 100; 0 disables). Lets the tool-use skill form "
-                             "before parsimony pressure is applied.")
-    parser.add_argument("--mgr_scale_rewards", type=str, default="none",
-                        choices=["none", "batch", "group"],
-                        help="GRPO advantage scaling (default none, Dr. GRPO style). 'group' "
-                             "divides by per-group std and amplifies the tiny -cost*k gaps in "
-                             "all-correct groups into full-size anti-tool advantages -> tool "
-                             "collapse under ADC. 'batch' is a middle ground if parsimony "
-                             "learns too slowly under 'none'.")
-    # CGC — Counterfactual Group Composition (Design A; see DESIGN_A_CGC.md)
-    parser.add_argument("--mgr_cgc_mode", action="store_true",
-                        help="Design A: harness disables tools for part of each GRPO group "
-                             "(paired counterfactual arms); reward is binary + small cost. "
-                             "The routing signal comes from group composition, not reward "
-                             "shaping. Requires binding_mode=environment. Takes priority "
-                             "over --mgr_adc_mode.")
-    parser.add_argument("--mgr_cgc_off_arm_fraction", type=float, default=0.5,
-                        help="Fraction of rollouts with tools disabled (default 0.5 = "
-                             "deterministic alternation, ~4/4 per group of 8).")
-    parser.add_argument("--mgr_cgc_cost_per_tool", type=float, default=0.01,
-                        help="CGC per-executed-tool cost on the on arm (default 0.01). "
-                             "Acts as a parsimony tiebreaker inside mixed groups.")
-    parser.add_argument("--mgr_cgc_missing_draft_penalty", type=float, default=0.05,
-                        help="CGC penalty per tool-calling TURN lacking a DRAFT_ANSWER_ "
-                             "line (default 0.05; on arm only, per-turn pairing).")
-    parser.add_argument("--mgr_cgc_cost_warmup_steps", type=int, default=100,
-                        help="Linearly ramp CGC cost_per_tool from 0 over N steps "
-                             "(default 100; 0 disables).")
-    parser.add_argument("--mgr_cgc_flatten", type=str, default="novar",
-                        choices=["novar", "none"],
-                        help="'novar' (default) zeroes the gradient of groups with no "
-                             "correctness variance (all right / all wrong) by setting all "
-                             "rewards in the group to the group mean — removes the pure-cost "
-                             "anti-tool drip that fuels collapse on hard datasets.")
     parser.add_argument("--mgr_full_parameter_rl", action="store_true",
                         help="Run full-parameter GRPO. If --mgr_init_adapter is set, merge it into the base model first.")
     parser.add_argument("--mgr_max_steps", type=int, default=-1)
@@ -332,23 +247,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--coldstart_force_diverse", action="store_true",
                         help="Skip teacher model; assign balanced tool-sequence distribution "
                              "(k=0/1/2/3) across coldstart examples. No API calls needed.")
-    parser.add_argument("--coldstart_draft_source", type=str, default="base_stepwise",
-                        choices=["base_stepwise", "base_initial", "oracle"],
-                        help="Source for DRAFT_ANSWER labels. 'base_stepwise' re-elicits "
-                             "the base manager after every sub-agent output (recommended); "
-                             "'base_initial' repeats one pre-tool prediction; 'oracle' "
-                             "reproduces the old ground-truth-draft ablation.")
-    parser.add_argument("--coldstart_draft_max_new_tokens", type=int, default=256,
-                        help="Generation cap for base-manager draft elicitation.")
-    parser.add_argument("--coldstart_draft_server_url", type=str, default="",
-                        help="OpenAI-compatible vLLM URL exposing the base model as 'base'. "
-                             "Required by --coldstart_draft_source base_stepwise.")
-    parser.add_argument("--coldstart_draft_model_name", type=str, default="base")
-    parser.add_argument("--coldstart_sequence_policy", type=str, default="mixed",
-                        choices=["mixed", "oracle", "teacher", "diverse"],
-                        help="Cold-start action supervision. mixed uses 25% format-diverse, "
-                             "25% correctness-cost oracle, and 50% teacher/on-policy plans.")
-    parser.add_argument("--coldstart_oracle_cost_per_tool", type=float, default=0.05)
     parser.add_argument("--coldstart_prompt_jsonl", type=str, default="",
                         help="Prompt JSONL for import_manager_coldstart_responses (output of export_manager_coldstart_prompts).")
     parser.add_argument("--coldstart_response_jsonl", type=str, default="",
@@ -362,27 +260,14 @@ def _parse_args() -> argparse.Namespace:
 
     # Eval
     parser.add_argument("--eval_n_samples", type=int, default=100)
-    parser.add_argument("--eval_per_task", type=int, default=0,
-                        help="If >0, sample this many held-out rows per task_subtype. "
-                             "Use 60 for a balanced 300-row LegalBench large5 eval.")
     parser.add_argument("--eval_kinds", type=str, default="extractor,reasoner,verifier")
-    parser.add_argument("--eval_manager_dir", type=str, default="",
-                        help="Manager checkpoint/adapter path, or reserved value 'base' "
-                             "to evaluate --base_model directly without tools.")
+    parser.add_argument("--eval_manager_dir", type=str, default="")
     parser.add_argument("--eval_temperature", type=float, default=0.0)
-    parser.add_argument("--eval_max_new_tokens", type=int, default=256)
-    parser.add_argument("--eval_max_total_manager_tokens", type=int, default=0,
-                        help="Optional total manager-generation cap across all tool turns. "
-                             "Use 1024 to match the strict routing-only Qwen3.5 Manager; 0 disables.")
-    parser.add_argument("--eval_enable_thinking", action="store_true",
-                        help="Explicitly enable the model's thinking chat template during evaluation.")
-    parser.add_argument("--eval_top_p", type=float, default=0.95)
-    parser.add_argument("--eval_top_k", type=int, default=20)
-    parser.add_argument("--eval_min_p", type=float, default=0.0)
+    parser.add_argument("--eval_max_new_tokens", type=int, default=1024)
     parser.add_argument("--eval_max_tool_calls", type=int, default=3)
     parser.add_argument("--eval_forced_tools", type=str, default="none",
                         help="Fixed delegation sequence for eval_manager_forced: comma-separated "
-                             "sub-agent kinds, e.g. 'extractor,reasoner,verifier', or 'none' for "
+                             "advisor kinds, e.g. 'extractor,reasoner,verifier', or 'none' for "
                              "the zero-delegation baseline. Running every subset yields fixed-k "
                              "baselines and the per-question stopping oracle.")
     parser.add_argument("--eval_out_tag", type=str, default="",
@@ -393,6 +278,63 @@ def _parse_args() -> argparse.Namespace:
                              "resampling control).")
     parser.add_argument("--eval_sc_temperature", type=float, default=0.7,
                         help="Sampling temperature for the self-consistency baseline.")
+
+    # Harness stopping: counterfactual collection
+    parser.add_argument("--cf_split", type=str, default="train",
+                        choices=["train", "dev", "test", "all"],
+                        help="Benchmark split to collect counterfactuals on. Use 'train' for "
+                             "probe fitting; 'test' ONLY for offline evaluation sweeps.")
+    parser.add_argument("--cf_n_samples", type=int, default=0,
+                        help="Max examples to collect (0 = all rows of the split).")
+    parser.add_argument("--cf_k_max", type=int, default=3,
+                        help="Forced-continuation budget: probe answers at stages 0..k_max.")
+    parser.add_argument("--cf_n_votes", type=int, default=5,
+                        help="Self-consistency votes sampled per stage for the confidence "
+                             "features (0 disables voting; probe quality degrades).")
+    parser.add_argument("--cf_vote_temperature", type=float, default=0.7,
+                        help="Sampling temperature for the per-stage answer votes.")
+    parser.add_argument("--cf_probe_max_new_tokens", type=int, default=512,
+                        help="max_new_tokens for the per-stage forced-answer probe (greedy + votes).")
+    parser.add_argument("--cf_out_tag", type=str, default="",
+                        help="Filename tag for counterfactual outputs (default: the split name).")
+
+    # Harness stopping: probe fitting + threshold selection
+    parser.add_argument("--probe_train_jsonl", type=str, default="",
+                        help="Comma-separated counterfactual JSONL path(s) for probe fitting.")
+    parser.add_argument("--probe_eval_jsonl", type=str, default="",
+                        help="Optional separate counterfactual JSONL for threshold selection. "
+                             "If empty, a deterministic per-question holdout is carved from "
+                             "--probe_train_jsonl.")
+    parser.add_argument("--probe_l2", type=float, default=1e-3,
+                        help="L2 regularization for the logistic stop probe.")
+    parser.add_argument("--probe_epsilon", type=float, default=0.005,
+                        help="Accuracy tolerance for threshold selection: pick the cheapest "
+                             "threshold with accuracy >= full-budget accuracy - epsilon.")
+    parser.add_argument("--probe_holdout_frac", type=float, default=0.25,
+                        help="Holdout fraction (by question) when --probe_eval_jsonl is empty.")
+    parser.add_argument("--probe_out", type=str, default="",
+                        help="Optional explicit output path for the fitted stop probe JSON.")
+    parser.add_argument("--probe_out_tag", type=str, default="",
+                        help="Filename tag for the probe and its report.")
+
+    # Harness stopping: adaptive eval + distillation export
+    parser.add_argument("--probe_path", type=str, default="",
+                        help="Path to a fitted stop probe JSON (from fit_stop_probe).")
+    parser.add_argument("--stop_threshold", type=float, default=-1.0,
+                        help="Stopping threshold override; negative uses the probe's "
+                             "recommended threshold.")
+    parser.add_argument("--adaptive_force_continue", action="store_true",
+                        help="Also override the manager's own early stops while the probe is "
+                             "unconfident (harness fully owns stopping in both directions).")
+    parser.add_argument("--distill_cf_jsonl", type=str, default="",
+                        help="Counterfactual JSONL (TRAIN split!) to distill into SFT rows.")
+    parser.add_argument("--distill_out_jsonl", type=str, default="",
+                        help="Optional output path for the stop-distillation SFT JSONL.")
+    parser.add_argument("--distill_allow_incorrect", action="store_true",
+                        help="Keep trajectories whose stage-k* answer is wrong (default: "
+                             "rejection-sample to correct-only).")
+    parser.add_argument("--distill_max_examples", type=int, default=0,
+                        help="Cap on counterfactual records to distill (0 = all).")
 
     return parser.parse_args()
 
@@ -517,39 +459,17 @@ def _load_benchmark_splits(args) -> dict:
     """Load the requested benchmark and return train/dev/test splits.
 
     Priority (first active wins): mmlu_pro > gpqa > legalbench > medqa.
-    Custom in-domain experiments are split deterministically using
-    --train_size / --dev_size / --test_size.  MMLU-Pro zero-shot evaluation
-    preserves the official test pool and never trains on it.
+    GPQA and MMLU-Pro have no predefined train/dev/test split, so rows are
+    split deterministically using --train_size / --dev_size / --test_size.
     """
     # MMLU-Pro: active when --mmlu_pro_normalized_cache is set OR
     #           --mmlu_pro_categories is non-empty OR stage == load_mmlu_pro
     if getattr(args, "stage", "") == "load_mmlu_pro" or _using_mmlu_pro(args):
         rows = _load_mmlu_pro_or_cache(args)
-        has_official_test = any(str(r.split or "").lower() == "test" for r in rows)
-        if args.train_size > 0 and has_official_test and not args.mmlu_pro_allow_test_training:
-            sys.exit(
-                "Refusing to train on the official MMLU-Pro test split. "
-                "For zero-shot transfer use --train_size 0. For an explicitly "
-                "non-standard in-domain partition, add "
-                "--mmlu_pro_allow_test_training and report it as a custom split."
-            )
         train, dev, test = stages._split_rows(
             rows=rows, train_size=args.train_size, dev_size=args.dev_size,
             test_size=args.test_size, seed=args.seed,
         )
-        from ..benchmarks.base import question_hash
-        split_hashes = {
-            "train": {question_hash(r.question) for r in train},
-            "dev": {question_hash(r.question) for r in dev},
-            "test": {question_hash(r.question) for r in test},
-        }
-        overlaps = {
-            "train/dev": len(split_hashes["train"] & split_hashes["dev"]),
-            "train/test": len(split_hashes["train"] & split_hashes["test"]),
-            "dev/test": len(split_hashes["dev"] & split_hashes["test"]),
-        }
-        if any(overlaps.values()):
-            raise RuntimeError(f"MMLU-Pro question leakage across splits: {overlaps}")
         print(f"[SPLIT/MMLU_PRO] train/dev/test = {len(train)}/{len(dev)}/{len(test)}")
         return {"all": rows, "train": train, "dev": dev, "test": test}
 
@@ -636,30 +556,11 @@ def main() -> None:
 
     if args.stage == "load_mmlu_pro":
         rows = _load_mmlu_pro_or_cache(args)
-        has_official_test = any(str(r.split or "").lower() == "test" for r in rows)
-        if args.train_size > 0 and has_official_test and not args.mmlu_pro_allow_test_training:
-            sys.exit(
-                "Refusing to train on the official MMLU-Pro test split. "
-                "Use --train_size 0, or explicitly add "
-                "--mmlu_pro_allow_test_training for a non-standard custom split."
-            )
         train, dev, test = stages._split_rows(
             rows=rows, train_size=args.train_size, dev_size=args.dev_size,
             test_size=args.test_size, seed=args.seed,
         )
         print(f"[LOAD_MMLU_PRO] train/dev/test = {len(train)}/{len(dev)}/{len(test)}")
-        return
-
-    if args.stage == "load_legalbench":
-        rows = _load_legalbench_or_cache(args)
-        train, dev, test = stages._split_rows(
-            rows=rows,
-            train_size=args.train_size,
-            dev_size=args.dev_size,
-            test_size=args.test_size,
-            seed=args.seed,
-        )
-        print(f"[LOAD_LEGALBENCH] train/dev/test = {len(train)}/{len(dev)}/{len(test)}")
         return
 
     if args.stage == "export_legalbench_jsonl":
@@ -681,26 +582,8 @@ def main() -> None:
             agent_kind=args.agent_kind,
             out_path=out_path,
             n_samples=args.n_samples,
-            verifier_candidate_jsonl=args.synth_verifier_candidate_jsonl,
-            random_verifier_candidates=args.synth_random_verifier_candidates,
-            allow_empty_verifier_candidates=args.synth_allow_empty_verifier_candidates,
-            min_verifier_candidate_coverage=args.synth_min_verifier_candidate_coverage,
         )
         print("[EXPORT_LEGALBENCH_JSONL]", result)
-        return
-
-    if args.stage == "export_base_predictions":
-        data = _load_benchmark_splits(args)
-        result = stages.run_export_base_predictions(
-            ctx=ctx,
-            rows=data["train"],
-            out_path=(args.base_prediction_out or None),
-            n_samples=args.base_prediction_n_samples,
-            task_description=args.task_description,
-            max_new_tokens=args.coldstart_draft_max_new_tokens,
-            stratify_by=args.base_prediction_stratify_by,
-        )
-        print("[EXPORT_BASE_PREDICTIONS]", result)
         return
 
     if args.stage == "synth_subagent":
@@ -718,11 +601,6 @@ def main() -> None:
             use_cache=(not args.synth_no_cache),
             max_workers=args.synth_workers,
             symmetric_leakage=args.synth_symmetric_leakage,
-            stratify_by=args.synth_stratify_by,
-            verifier_candidate_jsonl=args.synth_verifier_candidate_jsonl,
-            random_verifier_candidates=args.synth_random_verifier_candidates,
-            allow_empty_verifier_candidates=args.synth_allow_empty_verifier_candidates,
-            min_verifier_candidate_coverage=args.synth_min_verifier_candidate_coverage,
         )
         print("[SYNTH]", result)
         return
@@ -738,11 +616,6 @@ def main() -> None:
             agent_kind=kind,
             out_path=(args.deepseek_prompt_jsonl or None),
             n_samples=args.n_samples,
-            stratify_by=args.synth_stratify_by,
-            verifier_candidate_jsonl=args.synth_verifier_candidate_jsonl,
-            random_verifier_candidates=args.synth_random_verifier_candidates,
-            allow_empty_verifier_candidates=args.synth_allow_empty_verifier_candidates,
-            min_verifier_candidate_coverage=args.synth_min_verifier_candidate_coverage,
         )
         print("[EXPORT_DEEPSEEK_JSONL]", result)
         return
@@ -761,8 +634,6 @@ def main() -> None:
             out_path=(args.deepseek_sft_jsonl or None),
             teacher_model=args.deepseek_teacher_model,
             raw_responses=args.deepseek_import_raw_responses,
-            symmetric_leakage=args.synth_symmetric_leakage,
-            allow_empty_verifier_candidates=args.synth_allow_empty_verifier_candidates,
         )
         print("[IMPORT_DEEPSEEK_JSONL]", result)
         return
@@ -794,13 +665,7 @@ def main() -> None:
             per_device_batch_size=args.mgr_bs,
             max_completion_length=args.mgr_max_completion_length,
             temperature=args.mgr_temperature,
-            top_p=args.mgr_top_p,
-            top_k=args.mgr_top_k,
-            min_p=args.mgr_min_p,
-            enable_thinking=args.mgr_enable_thinking,
             num_generations=args.mgr_num_generations,
-            generation_batch_size=args.mgr_generation_batch_size,
-            learning_rate=args.mgr_learning_rate,
             grpo_beta=args.mgr_grpo_beta,
             routing_efficiency_bonus=args.mgr_routing_efficiency_bonus,
             tool_use_bonus=args.mgr_tool_use_bonus,
@@ -814,15 +679,6 @@ def main() -> None:
             adc_missing_draft_penalty=args.mgr_adc_missing_draft_penalty,
             adc_final_bonus=args.mgr_adc_final_bonus,
             adc_variant=args.mgr_adc_variant,
-            adc_format_penalty=args.mgr_adc_format_penalty,
-            adc_cost_warmup_steps=args.mgr_adc_cost_warmup_steps,
-            scale_rewards=args.mgr_scale_rewards,
-            cgc_mode=args.mgr_cgc_mode,
-            cgc_off_arm_fraction=args.mgr_cgc_off_arm_fraction,
-            cgc_cost_per_tool=args.mgr_cgc_cost_per_tool,
-            cgc_missing_draft_penalty=args.mgr_cgc_missing_draft_penalty,
-            cgc_cost_warmup_steps=args.mgr_cgc_cost_warmup_steps,
-            cgc_flatten=args.mgr_cgc_flatten,
             full_parameter_rl=args.mgr_full_parameter_rl,
             max_steps=args.mgr_max_steps,
             output_dir=(args.mgr_output_dir or None),
@@ -874,11 +730,6 @@ def main() -> None:
             prompt_jsonl=args.coldstart_prompt_jsonl,
             response_jsonl=args.coldstart_response_jsonl,
             out_path=(args.coldstart_out_jsonl or None),
-            draft_source=args.coldstart_draft_source,
-            draft_max_new_tokens=args.coldstart_draft_max_new_tokens,
-            draft_server_url=args.coldstart_draft_server_url,
-            draft_model_name=args.coldstart_draft_model_name,
-            subagent_server_url=args.subagent_server_url,
         )
         print("[IMPORT_MANAGER_COLDSTART_RESPONSES]", result)
         return
@@ -901,13 +752,6 @@ def main() -> None:
             use_lora=(not args.sft_no_lora),
             max_steps=args.sft_max_steps,
             force_diverse=args.coldstart_force_diverse,
-            draft_source=args.coldstart_draft_source,
-            draft_max_new_tokens=args.coldstart_draft_max_new_tokens,
-            draft_server_url=args.coldstart_draft_server_url,
-            draft_model_name=args.coldstart_draft_model_name,
-            subagent_server_url=args.subagent_server_url,
-            sequence_policy=args.coldstart_sequence_policy,
-            oracle_cost_per_tool=args.coldstart_oracle_cost_per_tool,
         )
         print("[MANAGER_COLDSTART_SFT]", result)
         return
@@ -935,13 +779,7 @@ def main() -> None:
             per_device_batch_size=args.mgr_bs,
             max_completion_length=args.mgr_max_completion_length,
             temperature=args.mgr_temperature,
-            top_p=args.mgr_top_p,
-            top_k=args.mgr_top_k,
-            min_p=args.mgr_min_p,
-            enable_thinking=args.mgr_enable_thinking,
             num_generations=args.mgr_num_generations,
-            generation_batch_size=args.mgr_generation_batch_size,
-            learning_rate=args.mgr_learning_rate,
             grpo_beta=args.mgr_grpo_beta,
             routing_efficiency_bonus=args.mgr_routing_efficiency_bonus,
             tool_use_bonus=args.mgr_tool_use_bonus,
@@ -955,15 +793,6 @@ def main() -> None:
             adc_missing_draft_penalty=args.mgr_adc_missing_draft_penalty,
             adc_final_bonus=args.mgr_adc_final_bonus,
             adc_variant=args.mgr_adc_variant,
-            adc_format_penalty=args.mgr_adc_format_penalty,
-            adc_cost_warmup_steps=args.mgr_adc_cost_warmup_steps,
-            scale_rewards=args.mgr_scale_rewards,
-            cgc_mode=args.mgr_cgc_mode,
-            cgc_off_arm_fraction=args.mgr_cgc_off_arm_fraction,
-            cgc_cost_per_tool=args.mgr_cgc_cost_per_tool,
-            cgc_missing_draft_penalty=args.mgr_cgc_missing_draft_penalty,
-            cgc_cost_warmup_steps=args.mgr_cgc_cost_warmup_steps,
-            cgc_flatten=args.mgr_cgc_flatten,
             full_parameter_rl=args.mgr_full_parameter_rl,
             max_steps=args.mgr_max_steps,
             output_dir=(args.mgr_output_dir or None),
@@ -1017,12 +846,7 @@ def main() -> None:
             task_description=args.task_description,
             sc_k=args.eval_sc_k,
             sc_temperature=args.eval_sc_temperature,
-            per_task=args.eval_per_task,
-            enable_thinking=args.eval_enable_thinking,
-            top_p=args.eval_top_p,
-            top_k=args.eval_top_k,
-            min_p=args.eval_min_p,
-            out_tag=args.eval_out_tag,
+          subagent_server_url=(args.subagent_server_url or None), 
         )
         print("[EVAL_MANAGER]", result)
         return
@@ -1040,14 +864,88 @@ def main() -> None:
             max_new_tokens=args.eval_max_new_tokens,
             task_description=args.task_description,
             out_tag=args.eval_out_tag,
-            per_task=args.eval_per_task,
-            subagent_server_url=args.subagent_server_url,
-            enable_thinking=args.eval_enable_thinking,
-            top_p=args.eval_top_p,
-            top_k=args.eval_top_k,
-            min_p=args.eval_min_p,
+          subagent_server_url=(args.subagent_server_url or None), 
         )
         print("[EVAL_MANAGER_FORCED]", result)
+        return
+
+    if args.stage == "collect_counterfactuals":
+        data = _load_benchmark_splits(args)
+        rows = data["all"] if args.cf_split == "all" else data[args.cf_split]
+        if not rows:
+            sys.exit(f"collect_counterfactuals: split '{args.cf_split}' is empty.")
+        result = stages.run_collect_counterfactuals(
+            ctx=ctx, rows=rows,
+            manager_dir=(args.eval_manager_dir or None),
+            n_samples=args.cf_n_samples,
+            k_max=args.cf_k_max,
+            temperature=args.eval_temperature,
+            max_new_tokens=args.eval_max_new_tokens,
+            n_votes=args.cf_n_votes,
+            vote_temperature=args.cf_vote_temperature,
+            probe_max_new_tokens=args.cf_probe_max_new_tokens,
+            task_description=args.task_description,
+            subagent_server_url=(args.subagent_server_url or None),
+            out_tag=(args.cf_out_tag or args.cf_split),
+        )
+        print("[COLLECT_COUNTERFACTUALS]", {k: v for k, v in result.items() if k != "sweep"})
+        return
+
+    if args.stage == "fit_stop_probe":
+        if not args.probe_train_jsonl:
+            sys.exit("fit_stop_probe requires --probe_train_jsonl")
+        train_jsonls = [p.strip() for p in args.probe_train_jsonl.split(",") if p.strip()]
+        result = stages.run_fit_stop_probe(
+            ctx=ctx,
+            train_jsonls=train_jsonls,
+            eval_jsonl=(args.probe_eval_jsonl or None),
+            l2=args.probe_l2,
+            epsilon=args.probe_epsilon,
+            holdout_frac=args.probe_holdout_frac,
+            out_path=(args.probe_out or None),
+            out_tag=args.probe_out_tag,
+        )
+        print("[FIT_STOP_PROBE]", {k: v for k, v in result.items() if k != "sweep"})
+        return
+
+    if args.stage == "eval_manager_adaptive":
+        if not args.probe_path:
+            sys.exit("eval_manager_adaptive requires --probe_path")
+        result = stages.run_eval_manager_adaptive(
+            ctx=ctx, rows=_load_eval_rows(args),
+            probe_path=args.probe_path,
+            manager_dir=(args.eval_manager_dir or None),
+            stop_threshold=args.stop_threshold,
+            n_samples=args.eval_n_samples,
+            k_max=args.cf_k_max,
+            temperature=args.eval_temperature,
+            max_new_tokens=args.eval_max_new_tokens,
+            n_votes=args.cf_n_votes,
+            vote_temperature=args.cf_vote_temperature,
+            probe_max_new_tokens=args.cf_probe_max_new_tokens,
+            force_continue=args.adaptive_force_continue,
+            task_description=args.task_description,
+            subagent_server_url=(args.subagent_server_url or None),
+            out_tag=args.eval_out_tag,
+        )
+        print("[EVAL_MANAGER_ADAPTIVE]", result)
+        return
+
+    if args.stage == "export_stop_distill_sft":
+        if not args.distill_cf_jsonl:
+            sys.exit("export_stop_distill_sft requires --distill_cf_jsonl")
+        if not args.probe_path:
+            sys.exit("export_stop_distill_sft requires --probe_path")
+        result = stages.run_export_stop_distill_sft(
+            ctx=ctx,
+            cf_jsonl=args.distill_cf_jsonl,
+            probe_path=args.probe_path,
+            stop_threshold=args.stop_threshold,
+            out_path=(args.distill_out_jsonl or None),
+            require_correct=(not args.distill_allow_incorrect),
+            max_examples=args.distill_max_examples,
+        )
+        print("[EXPORT_STOP_DISTILL_SFT]", result)
         return
 
     if args.stage == "eval_manager_tools":
@@ -1058,15 +956,8 @@ def main() -> None:
             temperature=args.eval_temperature,
             max_new_tokens=args.eval_max_new_tokens,
             max_tool_calls=args.eval_max_tool_calls,
-            max_total_manager_tokens=args.eval_max_total_manager_tokens,
             task_description=args.task_description,
-            per_task=args.eval_per_task,
-            subagent_server_url=args.subagent_server_url,
-            enable_thinking=args.eval_enable_thinking,
-            top_p=args.eval_top_p,
-            top_k=args.eval_top_k,
-            min_p=args.eval_min_p,
-            out_tag=args.eval_out_tag,
+          subagent_server_url=(args.subagent_server_url or None), 
         )
         print("[EVAL_MANAGER_TOOLS]", result)
         return

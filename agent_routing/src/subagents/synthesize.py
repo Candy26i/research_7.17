@@ -105,55 +105,19 @@ def _build_teacher_prompt(
     raise ValueError(f"Unknown kind: {kind}")
 
 
-def _sample_verifier_candidate(
-    kind: AgentKind,
-    row: StandardRow,
-    seed: int,
-    candidate_map: Optional[Dict[int, str]] = None,
-    allow_random_fallback: bool = False,
-) -> str:
-    """Use a real manager prediction as the verifier's audited candidate.
+def _sample_verifier_candidate(kind: AgentKind, row: StandardRow, seed: int) -> str:
+    """Half of verifier SFT samples audit a random candidate choice key.
 
-    Random candidates are retained only as an explicit legacy fallback; they
-    do not represent the model's natural error distribution.
+    Deterministic per (seed, example_id). A uniformly random candidate keeps the
+    audit signal unbiased w.r.t. the ground truth (candidate is correct with
+    probability 1/n_choices), so audits cannot become a leakage side-channel.
     """
     if kind != AgentKind.VERIFIER or not row.choices:
         return ""
-    mapped = str((candidate_map or {}).get(int(row.example_id), "")).strip()
-    if mapped in row.choices:
-        return mapped
-    if not allow_random_fallback:
-        return ""
     rng = random.Random((int(seed) << 32) ^ (int(row.example_id) * 2654435761 & 0xFFFFFFFF))
-    return rng.choice(list(row.choices.keys()))
-
-
-def _stratum(row: StandardRow, key: str) -> str:
-    if key == "task_subtype":
-        return row.task_subtype or "unknown"
-    if key.startswith("metadata:"):
-        return str(row.metadata.get(key.split(":", 1)[1], "")) or "unknown"
-    return str(getattr(row, key, "")) or "unknown"
-
-
-def _balanced_pool(rows: List[StandardRow], key: str, seed: int) -> List[StandardRow]:
-    if not key:
-        pool = list(rows)
-        random.Random(seed).shuffle(pool)
-        return pool
-    groups: Dict[str, List[StandardRow]] = {}
-    for row in rows:
-        groups.setdefault(_stratum(row, key), []).append(row)
-    rng = random.Random(seed)
-    for group in groups.values():
-        rng.shuffle(group)
-    ordered: List[StandardRow] = []
-    names = sorted(groups)
-    while any(groups[name] for name in names):
-        for name in names:
-            if groups[name]:
-                ordered.append(groups[name].pop())
-    return ordered
+    if rng.random() < 0.5:
+        return rng.choice(list(row.choices.keys()))
+    return ""
 
 
 
@@ -232,10 +196,6 @@ def synthesize_subagent_data(
     log_path: Optional[str] = None,
     max_workers: int = 8,
     symmetric_leakage: bool = False,
-    stratify_by: str = "",
-    verifier_candidate_map: Optional[Dict[int, str]] = None,
-    random_verifier_candidates: bool = False,
-    allow_empty_verifier_candidates: bool = False,
 ) -> SynthStats:
     """Synthesize SFT data for one subagent.
 
@@ -260,35 +220,14 @@ def synthesize_subagent_data(
     if auditor is None:
         auditor = LeakageAuditor()
 
-    pool = _balanced_pool(rows, stratify_by, seed)
-    if (
-        agent_kind == AgentKind.VERIFIER
-        and not random_verifier_candidates
-        and not allow_empty_verifier_candidates
-    ):
-        candidate_map = verifier_candidate_map or {}
-        pool = [
-            row for row in pool
-            if candidate_map.get(int(row.example_id), "") in row.choices
-        ]
-        if len(pool) < n_samples:
-            raise ValueError(
-                "Not enough candidate-bound rows to satisfy verifier synthesis: "
-                f"requested={n_samples}, available={len(pool)}. Export more base "
-                "predictions or lower --n_samples."
-            )
+    rng = random.Random(seed)
+    pool = list(rows)
+    rng.shuffle(pool)
 
     stats = SynthStats(requested=n_samples)
     _lock = threading.Lock()
     _succeeded_count = [0]  # mutable int for thread-safe check
     progress = tqdm(total=n_samples, desc=f"synth/{agent_kind.value}", ncols=100)
-    strata = sorted({_stratum(r, stratify_by) for r in pool}) if stratify_by else []
-    quota: Dict[str, int] = {}
-    accepted_by_stratum: Dict[str, int] = {}
-    if strata:
-        base, rem = divmod(n_samples, len(strata))
-        quota = {name: base + (1 if i < rem else 0) for i, name in enumerate(strata)}
-        accepted_by_stratum = {name: 0 for name in strata}
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8"):
@@ -300,13 +239,7 @@ def synthesize_subagent_data(
 
     def _process_one(row: StandardRow) -> Optional[Dict[str, Any]]:
         """Try up to max_retries_per_sample+1 times. Return sft_row dict or None."""
-        candidate = _sample_verifier_candidate(
-            agent_kind,
-            row,
-            seed,
-            candidate_map=verifier_candidate_map,
-            allow_random_fallback=random_verifier_candidates,
-        )
+        candidate = _sample_verifier_candidate(agent_kind, row, seed)
         for attempt in range(max_retries_per_sample + 1):
             # Stop early if we already have enough successes
             with _lock:
@@ -438,13 +371,10 @@ def synthesize_subagent_data(
                 "example_id": int(row.example_id),
                 "question_hash": _question_hash(row.question),
                 "benchmark_name": row.benchmark_name,
-                "task_subtype": row.task_subtype,
                 "agent_kind": agent_kind.value,
                 "teacher_provider": teacher.provider,
                 "teacher_model": teacher.model,
                 "candidate_answer": candidate,
-                "candidate_correct": bool(candidate and candidate == row.ground_truth),
-                "stratum": _stratum(row, stratify_by) if stratify_by else "",
                 "prompt": runtime_prompt,
                 "response": json.dumps(success_obj, ensure_ascii=False),
             }
@@ -461,16 +391,10 @@ def synthesize_subagent_data(
             sft_row = future.result()
             if sft_row is not None:
                 with _lock:
-                    stratum = str(sft_row.get("stratum") or "")
-                    stratum_open = (
-                        not quota or accepted_by_stratum.get(stratum, 0) < quota.get(stratum, 0)
-                    )
-                    if _succeeded_count[0] < n_samples and stratum_open:
+                    if _succeeded_count[0] < n_samples:
                         append_jsonl(out_path, [sft_row])
                         stats.succeeded += 1
                         _succeeded_count[0] += 1
-                        if quota:
-                            accepted_by_stratum[stratum] += 1
                         progress.update(1)
 
     progress.close()
@@ -486,15 +410,6 @@ def synthesize_subagent_data(
         "n_accepted": stats.succeeded,
         "stats": asdict(stats),
         "gt_visible_to_teacher": False,
-        "stratify_by": stratify_by,
-        "verifier_candidate_source": (
-            "manager_prediction_with_random_fallback"
-            if verifier_candidate_map and random_verifier_candidates else
-            ("manager_prediction" if verifier_candidate_map else
-             ("random" if random_verifier_candidates else
-              ("explicitly_empty" if allow_empty_verifier_candidates else "missing")))
-        ),
-        "accepted_by_stratum": accepted_by_stratum,
     })
 
     return stats

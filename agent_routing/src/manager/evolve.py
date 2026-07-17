@@ -22,13 +22,12 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from datasets import Dataset
-from transformers import AutoTokenizer, DataCollatorForSeq2Seq, Trainer, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq, Trainer, TrainingArguments
 
 from ..benchmarks.base import StandardRow, question_hash as _question_hash
-from ..subagents.runtime import FrozenSubagent, RemoteSubagentPool, SubagentPool
+from ..subagents.runtime import FrozenSubagent, SubagentPool
 from ..teachers.base import TeacherClient
 from ..utils.io import read_jsonl, write_jsonl, write_json
-from ..utils.modeling import discover_lora_target_modules, load_text_causal_lm
 from ..utils.seed import set_seed
 
 try:
@@ -37,18 +36,7 @@ try:
 except Exception:
     PEFT_AVAILABLE = False
 
-from ..utils.chat_template import ensure_nothink_chat_template
-from .prompt import (
-    build_manager_system_prompt,
-    build_manager_tool_schemas,
-    build_manager_user_message,
-    parse_final_answer,
-)
-
-try:
-    import requests as _requests
-except ImportError:
-    _requests = None
+from .prompt import build_manager_system_prompt, build_manager_user_message
 
 
 _ALLOWED_TOOLS = ("extractor_tool", "reasoner_tool", "verifier_tool")
@@ -77,8 +65,6 @@ def _teacher_choose_tool_sequence(
     context: str,
     choices: Dict[str, str],
     available_kinds: List[str],
-    current_draft: str = "",
-    task_description: str = "",
     fallback_seq: Optional[List[str]] = None,
 ) -> List[str]:
     """Ask the teacher which tool sequence (length 0-3) would best help solve this.
@@ -102,8 +88,7 @@ def _teacher_choose_tool_sequence(
         return seq[:3]
 
     sys_msg = (
-        "You design tool-use plans for a manager agent.\n"
-        f"Task: {task_description or 'multiple-choice question answering'}.\n"
+        "You design tool-use plans for a manager agent that must solve MMLU-Pro questions.\n"
         f"Available tools: {available_tools}.\n"
         "Choose a sequence of 0 to 3 tools (no repeats) to create DIVERSE, HIGH-QUALITY training data.\n"
         "Guidelines:\n"
@@ -122,8 +107,7 @@ def _teacher_choose_tool_sequence(
     user_msg = (
         f"QUESTION:\n{question}\n\n"
         f"{choices_block}"
-        f"CONTEXT:\n{context if context else '(no context)'}\n\n"
-        f"MANAGER'S CURRENT DRAFT:\n{current_draft or '(unavailable)'}\n"
+        f"CONTEXT:\n{context if context else '(no context)'}\n"
     )
     try:
         resp = teacher.chat(
@@ -171,11 +155,7 @@ def _tool_call_message(
         "tool_calls": [{
             "id": call_id,
             "type": "function",
-            # HF chat templates require a mapping here; the Qwen3.5 template
-            # raises "Can only get item pairs from a mapping" on the OpenAI
-            # wire format (a JSON string). _normalize_tool_args still converts
-            # string arguments found in older JSONL rows.
-            "function": {"name": tool_name, "arguments": dict(args)},
+            "function": {"name": tool_name, "arguments": json.dumps(args, ensure_ascii=False)},
         }],
     }
     if content:
@@ -185,191 +165,6 @@ def _tool_call_message(
 
 def _draft_answer_str(gt: str) -> str:
     return f"DRAFT_ANSWER_{_label_to_token(gt)}"
-
-
-class _RemoteManagerDraftGenerator:
-    """Elicit state-dependent manager beliefs from the shared vLLM server.
-
-    The sub-agent server exposes the base model as ``base`` alongside the three
-    LoRA sub-agents. This lets cold-start alternate manager -> sub-agent -> manager
-    without loading four separate 8B model copies in one Python process.
-    """
-
-    def __init__(
-        self,
-        server_url: str,
-        model_name: str = "base",
-        max_new_tokens: int = 256,
-        timeout: int = 180,
-    ) -> None:
-        if _requests is None:
-            raise RuntimeError("requests is required for stepwise cold-start drafts")
-        self.server_url = server_url.rstrip("/")
-        self.model_name = model_name
-        self.max_new_tokens = max_new_tokens
-        self.timeout = timeout
-
-    def predict(
-        self,
-        messages: List[Dict[str, Any]],
-        choice_keys: List[str],
-    ) -> Optional[str]:
-        if not messages:
-            return None
-        calibration = (
-            "\n\nCalibration pass: tools are temporarily unavailable. Based only on "
-            "the conversation above, report your current best answer. Put your answer "
-            "on the FIRST line as exactly one ANSWER_<TOKEN> line, then reasoning may follow."
-        )
-        request_messages = [dict(m) for m in messages]
-        request_messages = [dict(m) for m in messages]
-        # tool_call arguments must be a JSON *string* for the vLLM OpenAI API
-        for m in request_messages:
-            if m.get("tool_calls"):
-                m["tool_calls"] = [
-                    {**tc, "function": {
-                        **tc["function"],
-                        "arguments": tc["function"]["arguments"] if isinstance(tc["function"].get("arguments"), str)
-                                     else __import__("json").dumps(tc["function"].get("arguments") or {})
-                    }} for tc in m["tool_calls"]
-                ]
-        request_messages[0] = dict(request_messages[0])
-        request_messages[0]["content"] = str(request_messages[0].get("content") or "") + calibration
-        request_messages[0] = dict(request_messages[0])
-        request_messages[0]["content"] = str(request_messages[0].get("content") or "") + calibration
-        # NOTE: this is a raw JSON payload, not an openai-python call —
-        # "extra_body" is a client-library concept and must not appear here.
-        # vLLM reads chat_template_kwargs at the top level.
-        payload = {
-            "model": self.model_name,
-            "messages": request_messages,
-            "temperature": 0.0,
-            "max_tokens": self.max_new_tokens,
-            "chat_template_kwargs": {"enable_thinking": False},
-        }
-        resp = _requests.post(
-            f"{self.server_url}/v1/chat/completions",
-            json=payload,
-            timeout=self.timeout,
-        )
-        resp.raise_for_status()
-        text = str(resp.json()["choices"][0]["message"].get("content") or "")
-        return parse_final_answer(text, choice_keys)
-
-
-def _build_remote_draft_generator(cfg: "ColdStartSFTConfig") -> Optional[_RemoteManagerDraftGenerator]:
-    if cfg.draft_source != "base_stepwise":
-        return None
-    if not cfg.draft_server_url:
-        raise ValueError(
-            "base_stepwise cold-start requires --coldstart_draft_server_url. "
-            "Start scripts/start_subagent_server.sh first."
-        )
-    return _RemoteManagerDraftGenerator(
-        server_url=cfg.draft_server_url,
-        model_name=cfg.draft_model_name,
-        max_new_tokens=cfg.draft_max_new_tokens,
-    )
-
-
-def _predict_base_initial_drafts(
-    base_model: str,
-    rows: List[StandardRow],
-    binding_mode: str,
-    task_description: str,
-    seed: int,
-    max_new_tokens: int = 256,
-) -> Dict[int, str]:
-    """Greedily elicit the base manager's pre-tool answer for each example.
-
-    Cold-start previously copied ``row.ground_truth`` into every draft.  That
-    produced oracle belief trajectories and made the verifier see only correct
-    candidates.  This pass deliberately runs *before* subagents are loaded, so
-    an 8B setup does not need the base manager and three sub-agent models resident
-    at the same time.
-
-    Only parseable on-policy predictions are returned.  We never fall back to
-    the ground truth: a format failure is skipped and reported instead of
-    silently reintroducing privileged information.
-    """
-    if not rows:
-        return {}
-
-    set_seed(seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
-    tok = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
-    if tok.pad_token_id is None and tok.eos_token_id is not None:
-        tok.pad_token_id = tok.eos_token_id
-    ensure_nothink_chat_template(tok, tag="COLDSTART_DRAFTS")
-    model = load_text_causal_lm(
-        base_model, torch_dtype=dtype, trust_remote_code=True
-    ).to(device)
-    model.eval()
-
-    predictions: Dict[int, str] = {}
-    for row in rows:
-        keys = list(row.choices.keys())
-        answer_lines = "\n".join(f"ANSWER_{_label_to_token(k)}" for k in keys)
-        system = (
-            (task_description or "Solve the multiple-choice question.")
-            + "\nTools are unavailable in this calibration pass. Put your answer on the "
-              "FIRST line as exactly one of the following, then reasoning may follow:\n"
-            + answer_lines
-        )
-        user = build_manager_user_message(
-            example_id=int(row.example_id),
-            question=row.question,
-            context=row.context,
-            choices=row.choices,
-            binding_mode=binding_mode,
-        )
-        prompt = _render_chat(
-            tok,
-            [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            add_generation_prompt=True,
-        )
-        inputs = tok(prompt, return_tensors="pt", truncation=True, max_length=4096).to(device)
-        with torch.no_grad():
-            output = model.generate(
-                **inputs,
-                do_sample=False,
-                max_new_tokens=max_new_tokens,
-                pad_token_id=tok.pad_token_id,
-                eos_token_id=tok.eos_token_id,
-            )
-        text = tok.decode(output[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-        pred = parse_final_answer(text, keys)
-        if pred is not None:
-            predictions[int(row.example_id)] = pred
-
-    # Release the base model before the three frozen sub-agents are loaded.
-    del model
-    del tok
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    return predictions
-
-
-def _coldstart_draft_map(
-    cfg: "ColdStartSFTConfig",
-    rows: List[StandardRow],
-) -> Dict[int, str]:
-    if cfg.draft_source == "oracle":
-        return {int(r.example_id): str(r.ground_truth) for r in rows}
-    if cfg.draft_source == "base_stepwise":
-        # Generated from the live conversation inside the trajectory builder.
-        return {}
-    if cfg.draft_source != "base_initial":
-        raise ValueError(f"Unknown cold-start draft source: {cfg.draft_source}")
-    return _predict_base_initial_drafts(
-        base_model=cfg.base_model,
-        rows=rows,
-        binding_mode=cfg.binding_mode,
-        task_description=cfg.task_description,
-        seed=cfg.seed,
-        max_new_tokens=cfg.draft_max_new_tokens,
-    )
 
 
 @dataclass
@@ -409,22 +204,6 @@ def _register_available_subagents(
     return pool, available_kinds
 
 
-def _coldstart_pool(
-    cfg: "ColdStartSFTConfig",
-    device: str,
-) -> tuple[Any, List[str]]:
-    if cfg.subagent_server_url:
-        kinds = ["extractor", "reasoner", "verifier"]
-        return RemoteSubagentPool(cfg.subagent_server_url, registered_kinds=kinds), kinds
-    return _register_available_subagents(
-        cfg.base_model,
-        cfg.extractor_adapter,
-        cfg.reasoner_adapter,
-        cfg.verifier_adapter,
-        device,
-    )
-
-
 def _coldstart_fallback_sequence(idx: int, context: str, available_kinds: List[str]) -> List[str]:
     available_tools = {k + "_tool" for k in available_kinds}
     if context and len(context) > 800 and "extractor_tool" in available_tools:
@@ -443,10 +222,6 @@ def _build_manager_tool_sft_rows(
     pool: SubagentPool,
     available_kinds: List[str],
     teacher: Optional[TeacherClient],
-    draft_answers: Dict[int, str],
-    draft_source: str,
-    draft_generator: Optional[_RemoteManagerDraftGenerator],
-    forced_sequences: Optional[Dict[int, List[str]]],
     binding_mode: str,
     task_description: str,
     cache_namespace: str,
@@ -477,65 +252,49 @@ def _build_manager_tool_sft_rows(
             {"role": "user", "content": user_msg},
         ]
 
-        draft_answer = draft_answers.get(eid)
-        if draft_answer not in row.choices and draft_generator is not None:
-            draft_answer = draft_generator.predict(base_messages, list(row.choices.keys()))
-        if draft_answer not in row.choices:
-            # Never substitute ground truth for a missing/unparseable manager
-            # prediction. Skipping exposes format failures instead of creating
-            # an oracle belief trajectory.
-            continue
-
         fallback_seq = _coldstart_fallback_sequence(idx, row.context, available_kinds)
-        if forced_sequences is not None and eid in forced_sequences:
-            seq = [t for t in forced_sequences[eid] if t in _ALLOWED_TOOLS][:3]
-        else:
-            seq = _teacher_choose_tool_sequence(
-                teacher=teacher,
+        seq = _teacher_choose_tool_sequence(
+            teacher=teacher,
+            question=row.question,
+            context=row.context,
+            choices=row.choices,
+            available_kinds=available_kinds,
+            fallback_seq=fallback_seq,
+        )
+
+        tool_outputs: Dict[str, str] = {}
+        for tname in seq:
+            kind = _TOOL_NAME_TO_KIND[tname]
+            if not pool.has(kind):
+                continue
+            tool_outputs[tname] = pool.call(
+                agent_kind=kind,
+                example_id=eid,
                 question=row.question,
                 context=row.context,
                 choices=row.choices,
-                available_kinds=available_kinds,
-                current_draft=draft_answer,
-                task_description=task_description,
-                fallback_seq=fallback_seq,
+                cache_namespace=cache_namespace,
+                candidate_answer=(row.ground_truth if kind == "verifier" else ""),
             )
 
         final_text = _final_answer_str(row.ground_truth)
+        draft_text = _draft_answer_str(row.ground_truth)
         qhash = _question_hash(row.question)
-        audit = {
-            "draft_source": draft_source,
-            "initial_draft": draft_answer,
-            "initial_draft_correct": draft_answer == row.ground_truth,
-            "ground_truth": row.ground_truth,
-        }
         if not seq:
             sft_rows.append({
                 "example_id": eid,
                 "question_hash": qhash,
                 "prompt": base_messages,
                 "response": [{"role": "assistant", "content": final_text}],
-                "draft_sequence": [draft_answer],
-                "final_on_policy_draft": draft_answer,
-                **audit,
             })
             continue
 
         history = list(base_messages)
-        # Belief states, not tool turns: initial belief followed by one
-        # post-sub-agent belief per executed tool. Keeping the final update is
-        # essential for measuring whether a one-tool trajectory corrected or
-        # corrupted the manager's answer.
-        draft_sequence: List[str] = [draft_answer]
         for i, tname in enumerate(seq):
-            kind = _TOOL_NAME_TO_KIND[tname]
-            if not pool.has(kind):
-                continue
             call_id = f"call_{eid}_{i+1}"
-            draft_text = _draft_answer_str(draft_answer)
             # ADC policy: every tool-calling turn states the current draft answer;
             # verifier calls pass the draft so it audits that hypothesis.
-            extra_args = {"current_draft": draft_answer} if tname == "verifier_tool" else None
+            extra_args = {"current_draft": row.ground_truth} if tname == "verifier_tool" else None
             asst_call = _tool_call_message(
                 tname, eid, call_id, binding_mode,
                 content=draft_text, extra_args=extra_args,
@@ -545,44 +304,20 @@ def _build_manager_tool_sft_rows(
                 "question_hash": qhash,
                 "prompt": list(history),
                 "response": [asst_call],
-                **audit,
-                "draft_step": i,
-                "current_draft": draft_answer,
-                "current_draft_correct": draft_answer == row.ground_truth,
             })
-            tool_output = pool.call(
-                agent_kind=kind,
-                example_id=eid,
-                question=row.question,
-                context=row.context,
-                choices=row.choices,
-                cache_namespace=cache_namespace,
-                candidate_answer=(draft_answer if kind == "verifier" else ""),
-            )
             tool_msg = {
                 "role": "tool",
                 "tool_call_id": call_id,
                 "name": tname,
-                "content": tool_output,
+                "content": tool_outputs.get(tname, '{"error":"tool_not_available"}'),
             }
             history = history + [asst_call, tool_msg]
-            if draft_generator is not None:
-                updated = draft_generator.predict(history, list(row.choices.keys()))
-                if updated in row.choices:
-                    draft_answer = updated
-            draft_sequence.append(draft_answer)
 
         sft_rows.append({
             "example_id": eid,
             "question_hash": qhash,
             "prompt": list(history),
-            # Drafts are required only on delegating turns.  The terminal turn
-            # receives ordinary oracle answer supervision without pretending
-            # that the manager's pre-tool belief was oracle-correct.
-            "response": [{"role": "assistant", "content": final_text}],
-            **audit,
-            "draft_sequence": draft_sequence,
-            "final_on_policy_draft": draft_answer,
+            "response": [{"role": "assistant", "content": f"{draft_text}\n{final_text}"}],
         })
         if (idx + 1) % 50 == 0:
             elapsed = time.time() - t0
@@ -614,7 +349,6 @@ def build_manager_sft_from_failures(cfg: EvolveSFTConfig) -> str:
 
     # Read failures, dedupe by example_id, cap.
     fails: List[int] = []
-    failed_drafts: Dict[int, str] = {}
     seen = set()
     if not os.path.exists(cfg.fail_buffer_jsonl):
         raise FileNotFoundError(f"fail_buffer not found: {cfg.fail_buffer_jsonl}")
@@ -630,14 +364,8 @@ def build_manager_sft_from_failures(cfg: EvolveSFTConfig) -> str:
             continue
         if eid not in row_index:
             continue
-        pred = str(row.get("pred") or "").strip()
-        if pred not in row_index[eid].choices:
-            # A malformed completion has no defensible belief label.  Do not
-            # replace it with the ground truth in an evolve trajectory.
-            continue
         seen.add(eid)
         fails.append(eid)
-        failed_drafts[eid] = pred
         if len(fails) >= cfg.max_fail_samples:
             break
 
@@ -649,10 +377,6 @@ def build_manager_sft_from_failures(cfg: EvolveSFTConfig) -> str:
         pool=pool,
         available_kinds=available_kinds,
         teacher=cfg.teacher,
-        draft_answers=failed_drafts,
-        draft_source="failed_manager",
-        draft_generator=None,
-        forced_sequences=None,
         binding_mode=cfg.binding_mode,
         task_description=cfg.task_description,
         cache_namespace="evolve",
@@ -685,85 +409,46 @@ class ColdStartSFTConfig:
     n_samples: int = 300
     binding_mode: str = "environment"
     task_description: str = ""
-    draft_source: str = "base_stepwise"
-    draft_max_new_tokens: int = 256
-    draft_server_url: str = ""
-    draft_model_name: str = "base"
-    subagent_server_url: str = ""
-    oracle_cost_per_tool: float = 0.05
 
 
-def build_manager_sft_from_rows(
-    cfg: ColdStartSFTConfig,
-    forced_sequences: Optional[Dict[int, List[str]]] = None,
-    out_path: Optional[str] = None,
-) -> str:
+def build_manager_sft_from_rows(cfg: ColdStartSFTConfig) -> str:
     """Build manager tool-call SFT rows from ordinary training examples."""
     set_seed(cfg.seed)
     os.makedirs(cfg.out_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    pool, available_kinds = _register_available_subagents(
+        cfg.base_model,
+        cfg.extractor_adapter,
+        cfg.reasoner_adapter,
+        cfg.verifier_adapter,
+        device,
+    )
+    if not available_kinds:
+        raise ValueError("No subagent adapters available for cold-start SFT.")
 
     sample = list(cfg.rows)
     random.Random(cfg.seed).shuffle(sample)
     if cfg.n_samples > 0:
         sample = sample[:cfg.n_samples]
 
-    # Elicit beliefs before loading sub-agents to avoid keeping four model copies
-    # resident at once.  Oracle drafts remain available only as an explicit
-    # ablation via draft_source="oracle".
-    draft_answers = _coldstart_draft_map(cfg, sample)
-    draft_generator = _build_remote_draft_generator(cfg)
-    if draft_generator is None:
-        sample = [r for r in sample if int(r.example_id) in draft_answers]
-    if not sample:
-        raise ValueError(
-            "No parseable base-manager drafts were produced for cold-start. "
-            "Inspect the base model answer format instead of falling back to ground truth."
-        )
-    pool, available_kinds = _coldstart_pool(cfg, device)
-    if not available_kinds:
-        raise ValueError("No subagent adapters available for cold-start SFT.")
-
-    n_correct = sum(
-        draft_answers.get(int(r.example_id)) == r.ground_truth for r in sample
-    ) if draft_answers else 0
-    print(
-        f"[COLDSTART] building SFT data for {len(sample)} examples | "
-        f"draft_source={cfg.draft_source} "
-        f"initial_draft_acc={(n_correct/max(1, len(sample)) if draft_answers else float('nan')):.3f} | "
-        f"subagents={available_kinds}"
-    )
+    print(f"[COLDSTART] building SFT data for {len(sample)} examples | subagents={available_kinds}")
     sft_rows = _build_manager_tool_sft_rows(
         rows=sample,
         pool=pool,
         available_kinds=available_kinds,
         teacher=cfg.teacher,
-        draft_answers=draft_answers,
-        draft_source=cfg.draft_source,
-        draft_generator=draft_generator,
-        forced_sequences=forced_sequences,
         binding_mode=cfg.binding_mode,
         task_description=cfg.task_description,
         cache_namespace="coldstart",
     )
 
-    if out_path is None:
-        out_path = os.path.join(cfg.out_dir, "manager_sft_coldstart.jsonl")
-    seqs = [r["draft_sequence"] for r in sft_rows if "draft_sequence" in r]
-    n_changed = sum(1 for s in seqs if len(set(s)) > 1)
+    out_path = os.path.join(cfg.out_dir, "manager_sft_coldstart.jsonl")
     write_jsonl(out_path, sft_rows)
-    write_json(out_path + ".meta.json", {
+    write_json(os.path.join(cfg.out_dir, "coldstart_run_config.json"), {
         "n_examples": len(sample),
         "n_sft_rows": len(sft_rows),
         "available_kinds": available_kinds,
-        "draft_changed_after_tools": n_changed,          # ← 新增
-        "draft_change_rate": round(n_changed / max(1, len(seqs)), 3),  # ← 新增
         "binding_mode": cfg.binding_mode,
-        "draft_source": cfg.draft_source,
-        "n_parseable_drafts": len(sample),
-        "initial_draft_accuracy": (
-            n_correct / max(1, len(sample)) if draft_answers else None
-        ),
         "teacher_provider": cfg.teacher.provider if cfg.teacher else "heuristic",
         "teacher_model": cfg.teacher.model if cfg.teacher else "",
     })
@@ -780,12 +465,12 @@ def make_diverse_sequences(
 
     Deterministic given seed. Sequences use only available agent kinds.
     Distribution when all 3 agents present:
-      k=0 (direct answer):           35%
+      k=0 (direct answer):           10%
       k=1 reasoner only:             25%
       k=1 extractor only:             5%
-      k=2 extractor→reasoner:        15%
-      k=2 reasoner→verifier:         15%
-      k=3 extractor→reasoner→verifier: 5%
+      k=2 extractor→reasoner:        25%
+      k=2 reasoner→verifier:         20%
+      k=3 extractor→reasoner→verifier: 15%
     """
     has_ext = "extractor" in available_kinds
     has_rsn = "reasoner" in available_kinds
@@ -793,12 +478,12 @@ def make_diverse_sequences(
 
     # (weight, sequence) — only include sequences whose agents are available
     _slots = [
-        (35, []),
+        (10, []),
         (25, ["reasoner_tool"] if has_rsn else []),
         (5,  ["extractor_tool"] if has_ext else []),
-        (15, ["extractor_tool", "reasoner_tool"] if (has_ext and has_rsn) else (["reasoner_tool"] if has_rsn else [])),
-        (15, ["reasoner_tool", "verifier_tool"] if (has_rsn and has_vrf) else (["reasoner_tool"] if has_rsn else [])),
-        (5, ["extractor_tool", "reasoner_tool", "verifier_tool"] if (has_ext and has_rsn and has_vrf) else (["reasoner_tool"] if has_rsn else [])),
+        (25, ["extractor_tool", "reasoner_tool"] if (has_ext and has_rsn) else (["reasoner_tool"] if has_rsn else [])),
+        (20, ["reasoner_tool", "verifier_tool"] if (has_rsn and has_vrf) else (["reasoner_tool"] if has_rsn else [])),
+        (15, ["extractor_tool", "reasoner_tool", "verifier_tool"] if (has_ext and has_rsn and has_vrf) else (["reasoner_tool"] if has_rsn else [])),
     ]
 
     # Build a flat template list proportional to weights
@@ -817,40 +502,52 @@ def make_diverse_sequences(
     return sequences
 
 
-def make_cost_aware_sequences(
+def build_manager_sft_from_sequences(
     cfg: ColdStartSFTConfig,
-    rows: List[StandardRow],
-) -> Dict[int, List[str]]:
-    """Enumerate sub-agent subsets and imitate the best correctness-cost action.
+    sequences: Dict[int, List[str]],
+    out_path: Optional[str] = None,
+) -> str:
+    """Build manager SFT trajectories using pre-computed tool sequences.
 
-    Ground truth selects the expert action sequence, but is never inserted into
-    a draft. Every simulated draft is elicited from the base manager after the
-    actual sub-agent output, making the supervision appropriate for stopping.
+    Intended for the offline batch workflow:
+      1. export_manager_coldstart_prompts -> prompts.jsonl
+      2. generate_openai_jsonl.py (or any batch API) -> responses.jsonl
+      3. import_manager_coldstart_responses calls this with parsed sequences
+
+    Subagents are still run locally to produce tool outputs; only the tool
+    *selection* decision comes from the pre-computed sequences.
     """
-    generator = _build_remote_draft_generator(cfg)
-    if generator is None:
-        raise ValueError("cost-aware oracle sequences require base_stepwise drafts")
+    set_seed(cfg.seed)
+    os.makedirs(cfg.out_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    pool, available_kinds = _coldstart_pool(cfg, device)
-    tools = [k + "_tool" for k in available_kinds]
-    candidates: List[List[str]] = [[]]
-    candidates.extend([[t] for t in tools])
-    candidates.extend([
-        ["extractor_tool", "reasoner_tool"],
-        ["extractor_tool", "verifier_tool"],
-        ["reasoner_tool", "verifier_tool"],
-        ["extractor_tool", "reasoner_tool", "verifier_tool"],
-    ])
-    candidates = [seq for seq in candidates if all(t in tools for t in seq)]
+    pool, available_kinds = _register_available_subagents(
+        cfg.base_model,
+        cfg.extractor_adapter,
+        cfg.reasoner_adapter,
+        cfg.verifier_adapter,
+        device,
+    )
+    available_tools = {k + "_tool" for k in available_kinds}
 
-    selected: Dict[int, List[str]] = {}
-    for row in rows:
+    selected = [r for r in cfg.rows if int(r.example_id) in sequences]
+    print(f"[COLDSTART_IMPORT] {len(selected)} examples | subagents={available_kinds}")
+
+    try:
+        from tqdm import tqdm
+        _iter = tqdm(selected, desc="[coldstart_import] building SFT rows", unit="ex")
+    except ImportError:
+        _iter = selected
+
+    sft_rows: List[Dict[str, Any]] = []
+    for row in _iter:
         eid = int(row.example_id)
-        system = build_manager_system_prompt(
+        seq = [t for t in sequences.get(eid, []) if t in available_tools][:3]
+
+        sys_prompt = build_manager_system_prompt(
             label_keys=list(row.choices.keys()),
             task_description=cfg.task_description,
         )
-        user = build_manager_user_message(
+        user_msg = build_manager_user_message(
             example_id=eid,
             question=row.question,
             context=row.context,
@@ -858,79 +555,78 @@ def make_cost_aware_sequences(
             binding_mode=cfg.binding_mode,
         )
         base_messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_msg},
         ]
-        initial = generator.predict(base_messages, list(row.choices.keys()))
-        if initial not in row.choices:
+
+        tool_outputs: Dict[str, str] = {}
+        for tname in seq:
+            kind = _TOOL_NAME_TO_KIND[tname]
+            if not pool.has(kind):
+                continue
+            tool_outputs[tname] = pool.call(
+                agent_kind=kind,
+                example_id=eid,
+                question=row.question,
+                context=row.context,
+                choices=row.choices,
+                cache_namespace="coldstart_import",
+                candidate_answer=(row.ground_truth if kind == "verifier" else ""),
+            )
+
+        final_text = _final_answer_str(row.ground_truth)
+        draft_text = _draft_answer_str(row.ground_truth)
+        qhash = _question_hash(row.question)
+        if not seq:
+            sft_rows.append({
+                "example_id": eid,
+                "question_hash": qhash,
+                "prompt": base_messages,
+                "response": [{"role": "assistant", "content": final_text}],
+            })
             continue
 
-        best_seq: List[str] = []
-        best_utility = float("-inf")
-        for seq in candidates:
-            history = list(base_messages)
-            current = initial
-            for i, tname in enumerate(seq):
-                kind = _TOOL_NAME_TO_KIND[tname]
-                call_id = f"oracle_{eid}_{i+1}"
-                asst = _tool_call_message(
-                    tname,
-                    eid,
-                    call_id,
-                    cfg.binding_mode,
-                    content=_draft_answer_str(current),
-                    extra_args=(
-                        {"current_draft": current}
-                        if tname == "verifier_tool" else None
-                    ),
-                )
-                output = pool.call(
-                    agent_kind=kind,
-                    example_id=eid,
-                    question=row.question,
-                    context=row.context,
-                    choices=row.choices,
-                    cache_namespace="coldstart_oracle",
-                    candidate_answer=(current if kind == "verifier" else ""),
-                )
-                history.extend([asst, {
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "name": tname,
-                    "content": output,
-                }])
-                updated = generator.predict(history, list(row.choices.keys()))
-                if updated in row.choices:
-                    current = updated
-
-            utility = (1.0 if current == row.ground_truth else 0.0) - (
-                cfg.oracle_cost_per_tool * len(seq)
+        history = list(base_messages)
+        for i, tname in enumerate(seq):
+            call_id = f"call_{eid}_{i+1}"
+            extra_args = {"current_draft": row.ground_truth} if tname == "verifier_tool" else None
+            asst_call = _tool_call_message(
+                tname, eid, call_id, cfg.binding_mode,
+                content=draft_text, extra_args=extra_args,
             )
-            if utility > best_utility or (
-                utility == best_utility and len(seq) < len(best_seq)
-            ):
-                best_utility = utility
-                best_seq = list(seq)
-        selected[eid] = best_seq
-    return selected
+            sft_rows.append({
+                "example_id": eid,
+                "question_hash": qhash,
+                "prompt": list(history),
+                "response": [asst_call],
+            })
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": tname,
+                "content": tool_outputs.get(tname, '{"error":"tool_not_available"}'),
+            }
+            history = history + [asst_call, tool_msg]
 
+        sft_rows.append({
+            "example_id": eid,
+            "question_hash": qhash,
+            "prompt": list(history),
+            "response": [{"role": "assistant", "content": f"{draft_text}\n{final_text}"}],
+        })
 
-def build_manager_sft_from_sequences(
-    cfg: ColdStartSFTConfig,
-    sequences: Dict[int, List[str]],
-    out_path: Optional[str] = None,
-) -> str:
-    """Build cold-start trajectories with externally selected tool sequences.
+    if out_path is None:
+        out_path = os.path.join(cfg.out_dir, "coldstart_from_sequences_sft.jsonl")
+    write_jsonl(out_path, sft_rows)
+    write_json(out_path + ".meta.json", {
+        "n_examples": len(selected),
+        "n_sft_rows": len(sft_rows),
+        "available_kinds": available_kinds,
+        "binding_mode": cfg.binding_mode,
+    })
+    print(f"[COLDSTART_IMPORT] {len(sft_rows)} SFT turns from {len(selected)} examples -> {out_path}")
+    return out_path
 
-    Draft generation is controlled by cfg.draft_source; with the default
-    base_stepwise mode, every tool result is followed by a fresh base-manager
-    belief elicitation before another delegation.
-    """
-    return build_manager_sft_from_rows(
-        cfg,
-        forced_sequences=sequences,
-        out_path=out_path or os.path.join(cfg.out_dir, "coldstart_from_sequences_sft.jsonl"),
-    )
 
 # -------------- Manager SFT --------------
 
@@ -940,7 +636,7 @@ class ManagerSFTConfig:
     train_jsonl: str
     out_dir: str
     seed: int = 42
-    max_seq_len: int = 8192
+    max_seq_len: int = 4096
     learning_rate: float = 2e-5
     num_train_epochs: int = 1
     per_device_batch_size: int = 1
@@ -951,54 +647,24 @@ class ManagerSFTConfig:
     lora_dropout: float = 0.05
     max_steps: int = -1
     bf16: bool = True
-    # Render the tool schemas into the SFT prompts so the SFT distribution
-    # matches GRPO/eval rollouts, where the chat template injects a "# Tools"
-    # section. Training without it teaches tool calls the model never sees
-    # advertised at rollout time.
-    binding_mode: str = "environment"
-    include_tool_schemas: bool = True
 
-def _normalize_tool_args(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """HF chat templates want tool_call arguments as a dict; the OpenAI API wants a JSON string."""
-    out = []
-    for m in messages:
-        m = dict(m)
-        if m.get("tool_calls"):
-            tcs = []
-            for tc in m["tool_calls"]:
-                tc = dict(tc)
-                fn = dict(tc.get("function", {}))
-                a = fn.get("arguments")
-                if isinstance(a, str):
-                    try:
-                        fn["arguments"] = json.loads(a) if a.strip() else {}
-                    except json.JSONDecodeError:
-                        fn["arguments"] = {}
-                tc["function"] = fn
-                tcs.append(tc)
-            m["tool_calls"] = tcs
-        out.append(m)
-    return out
-def _render_chat(tokenizer, messages, add_generation_prompt: bool, tools=None) -> str:
-    messages = _normalize_tool_args(messages)
+
+def _render_chat(tokenizer, messages, add_generation_prompt: bool) -> str:
     try:
         return tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=add_generation_prompt,
-            tools=tools, enable_thinking=False,
+            enable_thinking=False,
         )
     except TypeError:
         return tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=add_generation_prompt,
-            tools=tools,
         )
 
 
-def _tokenize_manager_sft(rows: List[Dict[str, Any]], tok, max_seq_len: int, tools=None) -> Dataset:
+def _tokenize_manager_sft(rows: List[Dict[str, Any]], tok, max_seq_len: int) -> Dataset:
     eos = tok.eos_token or ""
-    prefix_mismatches = 0
 
     def _map(ex: Dict[str, Any]) -> Dict[str, Any]:
-        nonlocal prefix_mismatches
         prompt_msgs = ex["prompt"]
         response_msgs = ex["response"]
         if isinstance(response_msgs, dict):
@@ -1006,33 +672,14 @@ def _tokenize_manager_sft(rows: List[Dict[str, Any]], tok, max_seq_len: int, too
         elif isinstance(response_msgs, str):
             response_msgs = [{"role": "assistant", "content": response_msgs}]
 
-        prompt_text = _render_chat(tok, prompt_msgs, add_generation_prompt=True, tools=tools)
-        full_text = _render_chat(
-            tok, prompt_msgs + response_msgs, add_generation_prompt=False, tools=tools
-        )
-        # Chat templates already close the assistant turn with EOS (e.g.
-        # "<|im_end|>\n"); appending another EOS would teach the model to emit
-        # a duplicate end-of-turn token.
-        if eos and eos not in full_text[-(len(eos) + 8):]:
-            full_text = full_text + eos
+        prompt_text = _render_chat(tok, prompt_msgs, add_generation_prompt=True)
+        full_text = _render_chat(tok, prompt_msgs + response_msgs, add_generation_prompt=False) + eos
 
         prompt_ids = tok(prompt_text, add_special_tokens=False)["input_ids"]
         full = tok(full_text, add_special_tokens=False)
-        # The label mask assumes token-level prefix identity between the
-        # rendered prompt and the full conversation. Verify instead of hoping:
-        # a mismatched boundary silently trains on (or masks) the wrong span.
-        plen = len(prompt_ids)
-        if full["input_ids"][:plen] != prompt_ids:
-            common = 0
-            for a, b in zip(full["input_ids"], prompt_ids):
-                if a != b:
-                    break
-                common += 1
-            plen = common
-            prefix_mismatches += 1
         input_ids = full["input_ids"][:max_seq_len]
         attention_mask = full["attention_mask"][:max_seq_len]
-        plen = min(plen, max_seq_len)
+        plen = min(len(prompt_ids), max_seq_len)
         labels = ([-100] * plen) + input_ids[plen:]
         labels = labels[:max_seq_len]
         if len(labels) < len(input_ids):
@@ -1041,14 +688,7 @@ def _tokenize_manager_sft(rows: List[Dict[str, Any]], tok, max_seq_len: int, too
         return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
     ds = Dataset.from_list(rows)
-    mapped = ds.map(_map, remove_columns=ds.column_names)
-    if prefix_mismatches:
-        print(
-            f"[MANAGER_SFT] WARNING: {prefix_mismatches} rows had a "
-            f"prompt/full tokenization boundary mismatch; label masks were "
-            f"realigned to the longest common token prefix."
-        )
-    return mapped
+    return ds.map(_map, remove_columns=ds.column_names)
 
 
 def train_manager_sft(cfg: ManagerSFTConfig) -> None:
@@ -1059,18 +699,17 @@ def train_manager_sft(cfg: ManagerSFTConfig) -> None:
     tok.padding_side = "left"
     if tok.pad_token_id is None and tok.eos_token_id is not None:
         tok.pad_token_id = tok.eos_token_id
-    # Match GRPO/eval: normalize the template default to nothink so the SFT
-    # target format is exactly what the rollout-time parser expects.
-    ensure_nothink_chat_template(tok, tag="MANAGER_SFT")
 
     dtype = torch.bfloat16 if (cfg.bf16 and device == "cuda") else torch.float32
-    model = load_text_causal_lm(
+    model = AutoModelForCausalLM.from_pretrained(
         cfg.base_model, torch_dtype=dtype, trust_remote_code=True
     ).to(device)
     model.config.use_cache = False
 
     if cfg.use_lora and PEFT_AVAILABLE:
-        target = discover_lora_target_modules(model)
+        candidate = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        present = {n.split(".")[-1] for n, _ in model.named_modules()}
+        target = [m for m in candidate if m in present] or ["q_proj", "v_proj"]
         lconf = LoraConfig(
             r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=cfg.lora_dropout,
             bias="none", task_type="CAUSAL_LM", target_modules=target,
@@ -1081,15 +720,8 @@ def train_manager_sft(cfg: ManagerSFTConfig) -> None:
     rows = read_jsonl(cfg.train_jsonl)
     if not rows:
         raise ValueError(f"No rows in {cfg.train_jsonl}")
-    tools = (
-        build_manager_tool_schemas(cfg.binding_mode)
-        if cfg.include_tool_schemas else None
-    )
-    print(
-        f"[MANAGER_SFT] tokenizing {len(rows)} rows "
-        f"(tool schemas in prompt: {bool(tools)}, binding={cfg.binding_mode}) ..."
-    )
-    train_ds = _tokenize_manager_sft(rows, tok, cfg.max_seq_len, tools=tools)
+    print(f"[MANAGER_SFT] tokenizing {len(rows)} rows ...")
+    train_ds = _tokenize_manager_sft(rows, tok, cfg.max_seq_len)
     total_steps = (len(train_ds) // (cfg.per_device_batch_size * cfg.gradient_accumulation_steps)) * cfg.num_train_epochs
     if cfg.max_steps > 0:
         total_steps = min(total_steps, cfg.max_steps)
