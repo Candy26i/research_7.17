@@ -225,6 +225,41 @@ def parse_draft_answer(text: str, choice_keys: List[str]) -> Optional[str]:
     return None
 
 
+def count_unpaired_tool_turns(
+    completion: Any,
+    choice_keys: List[str],
+) -> "tuple[int, int]":
+    """Return (n_tool_turns, n_unpaired): assistant turns carrying tool_calls,
+    and how many of them lack a DRAFT_ANSWER_ line in the same turn.
+
+    Per-TURN pairing is the semantically correct enforcement of "declare a
+    draft before each tool call": a global draft count can be satisfied
+    post-hoc after seeing tool results (see ADC_RESIDUAL_HOLES.md §2), which
+    corrupts the W->C correction statistics.
+    """
+    if not isinstance(completion, list):
+        return 0, 0
+    n_turns = 0
+    n_unpaired = 0
+    for msg in completion:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        if not msg.get("tool_calls"):
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            text = " ".join(
+                blk.get("text", "") for blk in content
+                if isinstance(blk, dict) and "text" in blk
+            )
+        else:
+            text = str(content or "")
+        n_turns += 1
+        if parse_draft_answer(text, choice_keys) is None:
+            n_unpaired += 1
+    return n_turns, n_unpaired
+
+
 def extract_answer_sequence(
     completion: Any,
     choice_keys: List[str],

@@ -272,6 +272,31 @@ def _parse_args() -> argparse.Namespace:
                              "all-correct groups into full-size anti-tool advantages -> tool "
                              "collapse under ADC. 'batch' is a middle ground if parsimony "
                              "learns too slowly under 'none'.")
+    # CGC — Counterfactual Group Composition (Design A; see DESIGN_A_CGC.md)
+    parser.add_argument("--mgr_cgc_mode", action="store_true",
+                        help="Design A: harness disables tools for part of each GRPO group "
+                             "(paired counterfactual arms); reward is binary + small cost. "
+                             "The routing signal comes from group composition, not reward "
+                             "shaping. Requires binding_mode=environment. Takes priority "
+                             "over --mgr_adc_mode.")
+    parser.add_argument("--mgr_cgc_off_arm_fraction", type=float, default=0.5,
+                        help="Fraction of rollouts with tools disabled (default 0.5 = "
+                             "deterministic alternation, ~4/4 per group of 8).")
+    parser.add_argument("--mgr_cgc_cost_per_tool", type=float, default=0.01,
+                        help="CGC per-executed-tool cost on the on arm (default 0.01). "
+                             "Acts as a parsimony tiebreaker inside mixed groups.")
+    parser.add_argument("--mgr_cgc_missing_draft_penalty", type=float, default=0.05,
+                        help="CGC penalty per tool-calling TURN lacking a DRAFT_ANSWER_ "
+                             "line (default 0.05; on arm only, per-turn pairing).")
+    parser.add_argument("--mgr_cgc_cost_warmup_steps", type=int, default=100,
+                        help="Linearly ramp CGC cost_per_tool from 0 over N steps "
+                             "(default 100; 0 disables).")
+    parser.add_argument("--mgr_cgc_flatten", type=str, default="novar",
+                        choices=["novar", "none"],
+                        help="'novar' (default) zeroes the gradient of groups with no "
+                             "correctness variance (all right / all wrong) by setting all "
+                             "rewards in the group to the group mean — removes the pure-cost "
+                             "anti-tool drip that fuels collapse on hard datasets.")
     parser.add_argument("--mgr_full_parameter_rl", action="store_true",
                         help="Run full-parameter GRPO. If --mgr_init_adapter is set, merge it into the base model first.")
     parser.add_argument("--mgr_max_steps", type=int, default=-1)
@@ -792,6 +817,12 @@ def main() -> None:
             adc_format_penalty=args.mgr_adc_format_penalty,
             adc_cost_warmup_steps=args.mgr_adc_cost_warmup_steps,
             scale_rewards=args.mgr_scale_rewards,
+            cgc_mode=args.mgr_cgc_mode,
+            cgc_off_arm_fraction=args.mgr_cgc_off_arm_fraction,
+            cgc_cost_per_tool=args.mgr_cgc_cost_per_tool,
+            cgc_missing_draft_penalty=args.mgr_cgc_missing_draft_penalty,
+            cgc_cost_warmup_steps=args.mgr_cgc_cost_warmup_steps,
+            cgc_flatten=args.mgr_cgc_flatten,
             full_parameter_rl=args.mgr_full_parameter_rl,
             max_steps=args.mgr_max_steps,
             output_dir=(args.mgr_output_dir or None),
@@ -927,6 +958,12 @@ def main() -> None:
             adc_format_penalty=args.mgr_adc_format_penalty,
             adc_cost_warmup_steps=args.mgr_adc_cost_warmup_steps,
             scale_rewards=args.mgr_scale_rewards,
+            cgc_mode=args.mgr_cgc_mode,
+            cgc_off_arm_fraction=args.mgr_cgc_off_arm_fraction,
+            cgc_cost_per_tool=args.mgr_cgc_cost_per_tool,
+            cgc_missing_draft_penalty=args.mgr_cgc_missing_draft_penalty,
+            cgc_cost_warmup_steps=args.mgr_cgc_cost_warmup_steps,
+            cgc_flatten=args.mgr_cgc_flatten,
             full_parameter_rl=args.mgr_full_parameter_rl,
             max_steps=args.mgr_max_steps,
             output_dir=(args.mgr_output_dir or None),

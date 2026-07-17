@@ -61,7 +61,48 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..utils.io import append_jsonl
-from .prompt import extract_answer_sequence, parse_final_answer
+from .prompt import count_unpaired_tool_turns, extract_answer_sequence, parse_final_answer
+
+
+# ---------------------------------------------------------------------------
+# CGC — Counterfactual Group Composition (Design A) support
+# ---------------------------------------------------------------------------
+# The harness disables tools for a fraction of each GRPO group (the "off arm")
+# by answering every tool call with this sentinel message. The reward detects
+# off-arm rollouts by the sentinel key and exempts them from tool costs and
+# draft-format penalties. See DESIGN_A_CGC.md.
+
+TOOLS_UNAVAILABLE_KEY = "tools_unavailable"
+TOOLS_UNAVAILABLE_MSG = (
+    '{"error": "tools_unavailable", '
+    '"detail": "Tools are disabled for this attempt. Do not call any more tools. '
+    'Answer directly now: end your reply with a single ANSWER_<TOKEN> line."}'
+)
+
+
+def _count_blocked_tool_msgs(completion: Any) -> int:
+    if not isinstance(completion, list):
+        return 0
+    n = 0
+    for msg in completion:
+        if isinstance(msg, dict) and msg.get("role") == "tool":
+            if TOOLS_UNAVAILABLE_KEY in _msg_text(msg.get("content")):
+                n += 1
+    return n
+
+
+def _transition_stats(y_hat_seq: List[Optional[str]], ground_truth: str) -> Tuple[int, int]:
+    """(corrections, corruptions) = (#W→C, #C→W) over consecutive entries."""
+    corrections = corruptions = 0
+    for i in range(len(y_hat_seq) - 1):
+        prev, curr = y_hat_seq[i], y_hat_seq[i + 1]
+        if prev is None or curr is None:
+            continue
+        if prev != ground_truth and curr == ground_truth:
+            corrections += 1
+        elif prev == ground_truth and curr != ground_truth:
+            corruptions += 1
+    return corrections, corruptions
 
 
 # ---------------------------------------------------------------------------
@@ -442,11 +483,32 @@ def build_reward_funcs(
     adc_variant: str = "anytime",
     adc_format_penalty: float = 0.2,
     adc_cost_warmup_steps: int = 100,
+    cgc_mode: bool = False,
+    cgc_cost_per_tool: float = 0.01,
+    cgc_missing_draft_penalty: float = 0.05,
+    cgc_cost_warmup_steps: int = 100,
+    cgc_flatten: str = "novar",
     is_main_process: bool = True,
 ):
     """Construct the reward function list passed to GRPOTrainer.
 
-    Mode priority: adc_mode > ccr_mode > binary.
+    Mode priority: cgc_mode > adc_mode > ccr_mode > binary.
+
+    CGC mode (Design A — counterfactual group composition):
+        Plain binary correctness plus a small per-tool cost, paired with a
+        harness that disables tools for half of each GRPO group (off arm,
+        detected here via the tools_unavailable sentinel). The routing signal
+        comes from group COMPOSITION (the group mean contains the no-tool
+        counterfactual), not from reward shaping. Off-arm rollouts are exempt
+        from tool cost and draft-format penalties. Drafts are pure telemetry:
+        no draft bonus, only a small per-tool-TURN missing-draft penalty on
+        the on arm (per-turn pairing closes the post-hoc draft hole, see
+        ADC_RESIDUAL_HOLES.md §2). cgc_flatten="novar" zeroes the gradient of
+        groups with no correctness variance (all right / all wrong) by
+        setting every reward in the group to the group mean — soft dynamic
+        sampling that removes the pure-cost anti-tool drip in hopeless or
+        trivial groups (the LLD collapse fuel) while mixed groups keep cost
+        as a parsimony tiebreaker.
 
     ADC mode (recommended):
         Anytime per-draft correctness reward + final correctness - tool cost.
@@ -480,14 +542,18 @@ def build_reward_funcs(
         **kwargs,
     ) -> List[float]:
         _call_count["n"] += 1
-        if adc_cost_warmup_steps > 0:
-            _ts = kwargs.get("trainer_state")
-            _step = getattr(_ts, "global_step", None) if _ts is not None else None
-            if _step is None:
-                _step = _call_count["n"]
-            cost_now = adc_cost_per_tool * min(1.0, float(_step) / float(adc_cost_warmup_steps))
-        else:
-            cost_now = adc_cost_per_tool
+        _ts = kwargs.get("trainer_state")
+        _step = getattr(_ts, "global_step", None) if _ts is not None else None
+        if _step is None:
+            _step = _call_count["n"]
+
+        def _warm(target: float, warmup_steps: int) -> float:
+            if warmup_steps > 0:
+                return target * min(1.0, float(_step) / float(warmup_steps))
+            return target
+
+        cost_now = _warm(adc_cost_per_tool, adc_cost_warmup_steps)
+        cgc_cost_now = _warm(cgc_cost_per_tool, cgc_cost_warmup_steps)
 
         n     = len(completions)
         gts   = _ensure_list(ground_truth, n)
@@ -495,10 +561,12 @@ def build_reward_funcs(
         ck_lists = _ensure_list(choice_keys, n)
 
         rewards: List[float] = []
+        corrects: List[bool] = []
         fail_rows:  List[Dict[str, Any]] = []
         trace_rows: List[Dict[str, Any]] = []
+        trace_index: List[int] = []  # completion index of each trace row
 
-        for c, gt, eid, keys in zip(completions, gts, eids, ck_lists):
+        for _ci, (c, gt, eid, keys) in enumerate(zip(completions, gts, eids, ck_lists)):
             stats    = _extract_completion_stats(c)
             keys_list = list(keys) if isinstance(keys, (list, tuple)) else []
             pred     = parse_final_answer(stats["last_assistant_text"], keys_list)
@@ -517,8 +585,46 @@ def build_reward_funcs(
             base_correct  = bool(valid_format and no_artifacts and no_tc_in_final and pred == gt)
             k = int(stats["tool_calls"])
 
+            # ---- CGC mode (Design A: paired counterfactual arms) ----
+            cgc_stats: Dict[str, Any] = {}
+            if cgc_mode:
+                n_blocked = _count_blocked_tool_msgs(c)
+                k_eff = max(0, int(stats["tool_msgs"]) - n_blocked)
+                is_truncated = bool(stats["last_msg_has_tool_calls"]) and pred is None
+                n_tool_turns, n_unpaired = count_unpaired_tool_turns(c, keys_list)
+                # Off arm (attempted a call, got the sentinel): pure binary,
+                # no cost, no draft-format penalty — the attempt was not a
+                # policy failure, the harness said no.
+                miss = 0.0 if n_blocked > 0 else cgc_missing_draft_penalty * n_unpaired
+                cgc_r = (1.0 if base_correct else 0.0) - cgc_cost_now * k_eff - miss
+                if not (valid_format and no_artifacts and no_tc_in_final) and not is_truncated:
+                    cgc_r = min(cgc_r, 0.0) - adc_format_penalty
+                reward = float(cgc_r)
+
+                # Draft telemetry (out of the reward entirely — exogenous
+                # measurement channel; see DESIGN_A_CGC.md).
+                y_seq = extract_answer_sequence(c, keys_list)
+                drafts_seq = y_seq[:-1] if (pred is not None and y_seq) else list(y_seq)
+                first_draft = next((d for d in drafts_seq if d is not None), None)
+                n_corr, n_corrupt = _transition_stats(y_seq, str(gt))
+                cgc_stats = {
+                    "k_eff": int(k_eff),
+                    "blocked_tool_calls": int(n_blocked),
+                    "off_arm": bool(n_blocked > 0),
+                    "used_tools": bool(k_eff > 0),
+                    "n_tool_turns": int(n_tool_turns),
+                    "n_unpaired_tool_turns": int(n_unpaired),
+                    "truncated": bool(is_truncated),
+                    "y_hat_seq": [str(y) if y is not None else None for y in y_seq],
+                    "first_draft": first_draft,
+                    "first_draft_correct": (bool(first_draft == gt) if first_draft is not None else None),
+                    "corrections": int(n_corr),
+                    "corruptions": int(n_corrupt),
+                    "cost_per_tool_effective": round(float(cgc_cost_now), 4),
+                }
+
             # ---- ADC mode ----
-            if adc_mode:
+            elif adc_mode:
                 y_hat_seq = extract_answer_sequence(c, keys_list)
                 # Dangling tool call with no final answer = the rollout was cut
                 # by the completion budget (TRL rolls the tool result back),
@@ -563,6 +669,7 @@ def build_reward_funcs(
                     reward = reward + tool_use_bonus
 
             rewards.append(float(reward))
+            corrects.append(bool(base_correct))
 
             if not base_correct and is_main_process and fail_buffer_jsonl:
                 fail_rows.append({
@@ -591,10 +698,14 @@ def build_reward_funcs(
                     "tool_msgs": int(stats["tool_msgs"]),
                     "tool_names_called": list(stats["tool_names_called"]),
                     "reward_mode": (
-                        f"adc:{adc_variant}" if adc_mode else ("ccr" if ccr_mode else "binary")
+                        "cgc" if cgc_mode else (
+                            f"adc:{adc_variant}" if adc_mode else ("ccr" if ccr_mode else "binary")
+                        )
                     ),
                 }
-                if adc_mode:
+                if cgc_mode:
+                    trace_entry.update(cgc_stats)
+                elif adc_mode:
                     trace_entry.update({
                         "y_hat_seq": adc_stats.get("y_hat_seq", []),
                         "corrections": adc_stats.get("corrections", 0),
@@ -613,6 +724,32 @@ def build_reward_funcs(
                         _ccr_implicit_confidence(k, ccr_k_max, ccr_p_high, ccr_p_low), 4
                     )
                 trace_rows.append(trace_entry)
+                trace_index.append(_ci)
+
+        # ---- CGC group flattening (soft dynamic sampling) ----
+        # Groups with zero correctness variance (all right / all wrong) carry
+        # no routing signal; their only within-group reward differences are
+        # cost/penalty terms, which are all tool-sided and act as a constant
+        # anti-tool drip (the collapse fuel on hard datasets). Setting every
+        # reward in such a group to the group mean makes all advantages 0.
+        # Groups are identified by example_id (robust to batch ordering).
+        if cgc_mode and cgc_flatten == "novar":
+            _groups: Dict[Any, List[int]] = defaultdict(list)
+            for _i, _e in enumerate(eids):
+                if _e is not None:
+                    _groups[_e].append(_i)
+            _flattened: set = set()
+            for _e, _idxs in _groups.items():
+                if len(_idxs) < 2:
+                    continue
+                if len({corrects[_i] for _i in _idxs}) == 1:
+                    _m = sum(rewards[_i] for _i in _idxs) / len(_idxs)
+                    for _i in _idxs:
+                        rewards[_i] = float(_m)
+                        _flattened.add(_i)
+            for _pos, _i in enumerate(trace_index):
+                trace_rows[_pos]["reward"] = float(rewards[_i])
+                trace_rows[_pos]["flattened"] = bool(_i in _flattened)
 
         if fail_rows and fail_buffer_jsonl:
             append_jsonl(fail_buffer_jsonl, fail_rows)
@@ -621,7 +758,9 @@ def build_reward_funcs(
 
         return rewards
 
-    if adc_mode:
+    if cgc_mode:
+        reward_fn.__name__ = "cgc_paired_binary"
+    elif adc_mode:
         reward_fn.__name__ = f"adc_{adc_variant}"
     elif ccr_mode:
         reward_fn.__name__ = "ccr_log_scoring"

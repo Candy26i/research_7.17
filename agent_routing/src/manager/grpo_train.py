@@ -57,7 +57,9 @@ from ..utils.io import write_json
 from ..utils.modeling import load_text_causal_lm
 from ..utils.seed import set_seed
 from .prompt import build_manager_system_prompt, build_manager_user_message
-from .reward import build_reward_funcs
+import random as _random
+
+from .reward import TOOLS_UNAVAILABLE_MSG, build_reward_funcs
 
 
 def _grpo_supports_environment_factory() -> bool:
@@ -150,6 +152,34 @@ def verifier_tool(example_id: int, current_draft: str = "") -> str:
     return _run_tool("verifier", int(example_id), candidate_answer=str(current_draft or ""))
 
 
+# --- CGC (Design A) arm assignment state ---
+# Configured once per training run via _cgc_configure(). Each environment
+# reset() (= one rollout) samples an arm: off-arm rollouts have every tool
+# call answered with the tools_unavailable sentinel, giving each GRPO group
+# a built-in no-tool counterfactual baseline. With off_fraction=0.5 arms
+# alternate deterministically (exact 50% marginal; exact 4/4 per group when
+# episode creation is group-contiguous); other fractions use a seeded RNG.
+_CGC = {"enabled": False, "off_fraction": 0.5, "counter": 0, "rng": None}
+
+
+def _cgc_configure(enabled: bool, off_fraction: float, seed: int) -> None:
+    _CGC["enabled"] = bool(enabled)
+    _CGC["off_fraction"] = float(off_fraction)
+    _CGC["counter"] = 0
+    _CGC["rng"] = _random.Random(int(seed))
+
+
+def _cgc_sample_off_arm() -> bool:
+    if not _CGC["enabled"]:
+        return False
+    f = float(_CGC["off_fraction"])
+    if abs(f - 0.5) < 1e-9:
+        _CGC["counter"] += 1
+        return (_CGC["counter"] % 2) == 0
+    rng = _CGC["rng"] or _random.Random(0)
+    return rng.random() < f
+
+
 class ManagerToolEnvironment:
     """Environment-binding alternative: tools don't take an example_id arg."""
 
@@ -164,6 +194,7 @@ class ManagerToolEnvironment:
         """
         self.example_id = int(example_id)
         self._called = set()
+        self._tools_blocked = _cgc_sample_off_arm()
         return None
 
     def _guard_repeat(self, kind: str) -> Optional[str]:
@@ -182,6 +213,8 @@ class ManagerToolEnvironment:
         Returns:
             JSON string with extracted facts.
         """
+        if getattr(self, "_tools_blocked", False):
+            return TOOLS_UNAVAILABLE_MSG
         err = self._guard_repeat("extractor")
         if err:
             return err
@@ -193,6 +226,8 @@ class ManagerToolEnvironment:
         Returns:
             JSON string with reasoning structure.
         """
+        if getattr(self, "_tools_blocked", False):
+            return TOOLS_UNAVAILABLE_MSG
         err = self._guard_repeat("reasoner")
         if err:
             return err
@@ -207,6 +242,8 @@ class ManagerToolEnvironment:
         Returns:
             JSON string with relevant principles, checks, and potential errors.
         """
+        if getattr(self, "_tools_blocked", False):
+            return TOOLS_UNAVAILABLE_MSG
         err = self._guard_repeat("verifier")
         if err:
             return err
@@ -383,6 +420,15 @@ class ManagerGRPOConfig:
                                          # advantages and collapses tool use as accuracy rises. "none"
                                          # (Dr. GRPO) keeps cost at its nominal scale; "batch" is a middle
                                          # ground if parsimony learns too slowly under "none".
+    # CGC — Counterfactual Group Composition (Design A; see DESIGN_A_CGC.md)
+    cgc_mode: bool = False               # paired arms: harness disables tools for part of each group;
+                                         # reward is binary + small cost. Takes priority over adc_mode.
+    cgc_off_arm_fraction: float = 0.5    # fraction of rollouts with tools disabled (0.5 = alternating)
+    cgc_cost_per_tool: float = 0.01      # small per-tool cost on the on arm (parsimony tiebreaker)
+    cgc_missing_draft_penalty: float = 0.05  # per tool-TURN lacking a DRAFT line (on arm only)
+    cgc_cost_warmup_steps: int = 100     # linear ramp of cgc_cost_per_tool from 0 (0 = off)
+    cgc_flatten: str = "novar"           # novar|none: zero the gradient of groups with no correctness
+                                         # variance (soft dynamic sampling; kills the pure-cost drip)
 
 
 def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
@@ -400,6 +446,18 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         raise RuntimeError(
             "binding_mode=environment requires a TRL version with environment_factory."
         )
+
+    # ---- CGC (Design A) arm assignment ----
+    if cfg.cgc_mode and binding_mode != "environment":
+        raise RuntimeError(
+            "cgc_mode (Design A paired counterfactual arms) requires "
+            "binding_mode=environment: arm assignment happens in "
+            "ManagerToolEnvironment.reset(), which the argument-binding tool "
+            "functions do not have."
+        )
+    if cfg.cgc_mode and cfg.adc_mode:
+        print("[MANAGER_GRPO] WARNING: cgc_mode takes priority over adc_mode; ADC reward is ignored.")
+    _cgc_configure(cfg.cgc_mode, cfg.cgc_off_arm_fraction, cfg.seed)
     print(f"[MANAGER_GRPO] binding_mode={binding_mode}")
 
     # ---- Build subagent pool ----
@@ -659,9 +717,29 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         adc_variant=cfg.adc_variant,
         adc_format_penalty=cfg.adc_format_penalty,
         adc_cost_warmup_steps=cfg.adc_cost_warmup_steps,
+        cgc_mode=cfg.cgc_mode,
+        cgc_cost_per_tool=cfg.cgc_cost_per_tool,
+        cgc_missing_draft_penalty=cfg.cgc_missing_draft_penalty,
+        cgc_cost_warmup_steps=cfg.cgc_cost_warmup_steps,
+        cgc_flatten=cfg.cgc_flatten,
         is_main_process=is_main,
     )
-    if cfg.adc_mode:
+    if cfg.cgc_mode:
+        print(
+            f"[MANAGER_GRPO] CGC mode ON (Design A)  "
+            f"off_arm_fraction={cfg.cgc_off_arm_fraction}  "
+            f"cost_per_tool={cfg.cgc_cost_per_tool}  "
+            f"cost_warmup_steps={cfg.cgc_cost_warmup_steps}  "
+            f"missing_draft_penalty={cfg.cgc_missing_draft_penalty}  "
+            f"flatten={cfg.cgc_flatten}  "
+            f"scale_rewards={cfg.scale_rewards}"
+        )
+        if cfg.scale_rewards == "group":
+            print(
+                "[MANAGER_GRPO] WARNING: scale_rewards='group' re-amplifies "
+                "cost gaps in low-variance groups. Use 'none' or 'batch' with CGC."
+            )
+    elif cfg.adc_mode:
         print(
             f"[MANAGER_GRPO] ADC mode ON  variant={cfg.adc_variant}  "
             f"draft_bonus={cfg.adc_draft_bonus}  "
@@ -758,6 +836,12 @@ def train_manager_grpo(cfg: ManagerGRPOConfig) -> None:
         "adc_variant": str(cfg.adc_variant),
         "adc_format_penalty": float(cfg.adc_format_penalty),
         "adc_cost_warmup_steps": int(cfg.adc_cost_warmup_steps),
+        "cgc_mode": bool(cfg.cgc_mode),
+        "cgc_off_arm_fraction": float(cfg.cgc_off_arm_fraction),
+        "cgc_cost_per_tool": float(cfg.cgc_cost_per_tool),
+        "cgc_missing_draft_penalty": float(cfg.cgc_missing_draft_penalty),
+        "cgc_cost_warmup_steps": int(cfg.cgc_cost_warmup_steps),
+        "cgc_flatten": str(cfg.cgc_flatten),
         "scale_rewards": str(cfg.scale_rewards),
         "mask_truncated_completions": bool(_grpo_extra.get("mask_truncated_completions", False)),
     })
